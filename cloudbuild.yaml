@@ -1,0 +1,32 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/apex-v7', '.']
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/apex-v7']
+
+  # Deploy container to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'apex-v7'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/apex-v7'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'KITE_API_KEY=${_KITE_API_KEY},KITE_ACCESS_TOKEN=${_KITE_ACCESS_TOKEN}'
+
+substitutions:
+  _KITE_API_KEY: ""
+  _KITE_ACCESS_TOKEN: ""
+
+images:
+  - 'gcr.io/$PROJECT_ID/apex-v7'
