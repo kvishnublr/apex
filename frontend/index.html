@@ -3110,29 +3110,40 @@ function startAlertPolling() {
 }
 
 // ==================== DASHBOARD ====================
-var dashboardData = [];
-var dashboardLiveInterval = null;
+var dashboardLoaded = false;
 
 async function loadDashboard() {
-  showToast('Loading dashboard from database...', 'info');
+  // Show loading state but allow interaction
+  document.getElementById('top-signals').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
   
-  var status = await api('/status');
+  // Load status and signals in parallel
+  var statusPromise = api('/status');
+  var scannerPromise = api('/scanner-cached?min_score=0');
+  
+  // Wait for both
+  var status, scanner;
+  try {
+    status = await statusPromise;
+    scanner = await scannerPromise;
+  } catch(e) {
+    showToast('Error loading data', 'error');
+    return;
+  }
+  
   if (status.error) { showToast('Failed to load', 'error'); return; }
   
   document.getElementById('h-universe').textContent = status.universe;
   document.getElementById('dash-universe').textContent = status.universe;
   
-  // Load cached data from DB
-  var scanner = await api('/scanner-cached?min_score=0');
-  
+  // Use cached data
   if (!scanner.stocks || scanner.stocks.length === 0) {
-    showToast('No cached data. Running scan...', 'info');
     scanner = await api('/scanner?min_score=0');
   }
   
   if (scanner.error) { showToast('Scanner error', 'error'); return; }
   
   dashboardData = scanner.stocks || [];
+  dashboardLoaded = true;
   
   // Filter quality signals
   var prime = dashboardData.filter(s => s && s.score >= 7 && s.adx >= 20).length;
@@ -3192,7 +3203,7 @@ async function loadDashboard() {
   
   document.getElementById('sector-grid').innerHTML = html || '<div class="empty-state">No sectors</div>';
   
-  // Top Signals - Clickable
+  // Top Signals - Clickable with ML indicators
   var top = dashboardData.filter(s => s.score >= 7).slice(0, 8);
   var topHtml = '';
   top.forEach(function(s) {
@@ -3200,11 +3211,18 @@ async function loadDashboard() {
     var dirColor = s.direction === 'LONG' ? '#10b981' : '#ef4444';
     var price = s.live_price || s.current || 0;
     var dirBg = s.direction === 'LONG' ? '#10b981' : '#ef4444';
+    var momentum = s.momentum_score || s.score * 10;
+    var confidence = s.ai_confidence || Math.round(momentum);
+    
     topHtml += '<div class="top-signal-card" onclick="showStockDetail(\'' + s.symbol + '\')">';
     topHtml += '<div style="display:flex;align-items:center;gap:12px;">';
     topHtml += '<div class="score-ring ' + scoreClass + '">' + s.score + '</div>';
     topHtml += '<div><div style="font-weight:700;font-size:16px;color:' + dirColor + ';">' + s.symbol + '</div>';
-    topHtml += '<div style="font-size:11px;color:#64748b;">' + (s.company || '') + '</div></div></div>';
+    topHtml += '<div style="font-size:11px;color:#64748b;">' + (s.company || '') + '</div>';
+    topHtml += '<div style="font-size:10px;margin-top:4px;">';
+    topHtml += '<span style="background:#f0f9ff;color:#0284c7;padding:2px 6px;border-radius:4px;font-weight:600;">M:' + momentum + '</span> ';
+    topHtml += '<span style="background:#fef3c7;color:#d97706;padding:2px 6px;border-radius:4px;font-weight:600;">C:' + confidence + '%</span>';
+    topHtml += '</div></div></div>';
     topHtml += '<div style="text-align:right;">';
     topHtml += '<div style="font-family:JetBrains Mono;font-size:16px;font-weight:700;">₹' + price.toLocaleString('en-IN') + '</div>';
     topHtml += '<div style="font-size:10px;color:#94a3b8;">' + (s.sector || '') + '</div>';

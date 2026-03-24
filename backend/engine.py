@@ -7,10 +7,16 @@ import math, random, datetime, json, statistics
 
 try:
     import numpy as np
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.ensemble import (
+        RandomForestClassifier, GradientBoostingClassifier, 
+        ExtraTreesClassifier, AdaBoostClassifier, VotingClassifier
+    )
     from sklearn.linear_model import LogisticRegression
     from sklearn.svm import SVC
     from sklearn.neural_network import MLPClassifier
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.naive_bayes import GaussianNB
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
     import warnings
@@ -1130,11 +1136,18 @@ def _train_models(symbol_data_cache):
         X_scaled = _ml_scaler.fit_transform(X)
         
         models = {
-            'rf': RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1),
-            'gb': GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=42),
-            'lr': LogisticRegression(random_state=42, max_iter=500),
-            'svm': SVC(kernel='rbf', probability=True, random_state=42),
-            'mlp': MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=300, random_state=42)
+            # Ensemble of powerful classifiers
+            'rf': RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_split=5, random_state=42, n_jobs=-1),
+            'gb': GradientBoostingClassifier(n_estimators=150, max_depth=6, learning_rate=0.1, random_state=42),
+            'lr': LogisticRegression(random_state=42, max_iter=1000, C=0.5),
+            'svm': SVC(kernel='rbf', probability=True, random_state=42, C=1.0),
+            'mlp': MLPClassifier(hidden_layer_sizes=(128, 64, 32), max_iter=500, random_state=42, early_stopping=True),
+            # Additional models for ensemble
+            'ada': AdaBoostClassifier(n_estimators=100, random_state=42),
+            'et': ExtraTreesClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
+            'nb': GaussianNB(),
+            'knn': KNeighborsClassifier(n_neighbors=5, weights='distance'),
+            'dt': DecisionTreeClassifier(max_depth=8, random_state=42),
         }
         
         for name, model in models.items():
@@ -1151,7 +1164,7 @@ def _train_models(symbol_data_cache):
         return False
 
 def predict_momentum_ml(rows):
-    """ML-based momentum prediction using sklearn ensemble."""
+    """ML-based momentum prediction using enhanced sklearn ensemble with 10 models."""
     if not _SKLEARN_AVAILABLE or not _ml_trained or not _ml_models:
         return None
     try:
@@ -1161,21 +1174,66 @@ def predict_momentum_ml(rows):
             return None
         X = _ml_scaler.transform([features])
         
+        # Collect predictions from all 10 models
         probas = {}
-        for name, model in _ml_models.items():
-            proba = model.predict_proba(X)[0]
-            probas[name] = proba[1]
+        votes = {'LONG': 0, 'SHORT': 0, 'NEUTRAL': 0}
         
-        avg_prob = sum(probas.values()) / len(probas)
-        direction = 'LONG' if avg_prob > 0.55 else ('SHORT' if avg_prob < 0.45 else 'NEUTRAL')
+        # Model weights for ensemble (more accurate models get higher weights)
+        model_weights = {
+            'rf': 1.2, 'gb': 1.2, 'et': 1.1, 'ada': 1.0, 'mlp': 1.1,
+            'lr': 0.9, 'svm': 1.0, 'nb': 0.8, 'knn': 0.9, 'dt': 0.8
+        }
+        
+        weighted_sum = 0
+        total_weight = 0
+        
+        for name, model in _ml_models.items():
+            prob = model.predict_proba(X)[0]
+            probas[name] = prob[1]
+            
+            # Weighted voting
+            weight = model_weights.get(name, 1.0)
+            weighted_sum += prob[1] * weight
+            total_weight += weight
+            
+            # Count votes
+            if prob[1] > 0.55:
+                votes['LONG'] += weight
+            elif prob[1] < 0.45:
+                votes['SHORT'] += weight
+            else:
+                votes['NEUTRAL'] += weight
+        
+        # Weighted average probability
+        avg_prob = weighted_sum / total_weight
+        
+        # Determine direction from majority vote
+        direction = max(votes, key=votes.get)
+        
+        # Calculate confidence from consensus
+        confidence = max(votes.values()) / total_weight
+        
+        # Trade signal based on ensemble
+        if avg_prob > 0.65 and direction == 'LONG':
+            trade_signal = 'STRONG_BUY'
+        elif avg_prob > 0.55 and direction == 'LONG':
+            trade_signal = 'BUY'
+        elif avg_prob < 0.35 and direction == 'SHORT':
+            trade_signal = 'STRONG_SELL'
+        elif avg_prob < 0.45 and direction == 'SHORT':
+            trade_signal = 'SELL'
+        else:
+            trade_signal = 'HOLD'
         
         return {
             'score': int(avg_prob * 100),
             'direction': direction,
-            'confidence': abs(avg_prob - 0.5) * 2,
+            'confidence': confidence,
             'avg_prob': avg_prob,
             'model_probs': {k: round(v, 3) for k, v in probas.items()},
-            'trade_signal': 'BUY' if avg_prob > 0.6 else ('SELL' if avg_prob < 0.4 else 'HOLD')
+            'votes': votes,
+            'trade_signal': trade_signal,
+            'ensemble_strength': round(avg_prob if direction == 'LONG' else 1-avg_prob, 3)
         }
     except Exception:
         return None
