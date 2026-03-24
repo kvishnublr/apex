@@ -2894,9 +2894,11 @@ td:first-child {
 var API = 'http://localhost:5000/api';
 var currentMode = 'SWING';
 var stockData = [];
-var cache = {};
+var dashboardData = [];
+var signalData = [];
 var alerts = [];
 var alertPollTimer = null;
+var dataCache = { dashboard: null, signals: null, scanner: null };
 
 // ==================== CORE FUNCTIONS ====================
 
@@ -2911,6 +2913,17 @@ function nav(page) {
   
   var titles = {dashboard:'Dashboard', scanner:'Stock Scanner', signals:'Trading Signals', momentum:'Momentum', swing:'Swing Trades', intraday:'Intraday', heatmap:'Sector Heatmap', oispikes:'OI Spikes', backtest:'Backtest', risk:'Risk Calculator', journal:'Signal History'};
   document.getElementById('page-title').textContent = titles[page] || 'Dashboard';
+  
+  // Use cached data if available
+  if (page === 'dashboard' && dashboardData.length > 0) {
+    renderDashboard(); return;
+  }
+  if (page === 'signals' && signalData.length > 0) {
+    renderSignals(); return;
+  }
+  if (page === 'scanner' && stockData.length > 0) {
+    renderScanner(); return;
+  }
   
   if (page === 'dashboard') loadDashboard();
   if (page === 'scanner') loadScannerPage();
@@ -3461,6 +3474,99 @@ function renderSignals() {
   }).join('');
   
   showToast(stocks.length + ' signals loaded', 'success');
+}
+
+function renderDashboard() {
+  if (dashboardData.length === 0) return;
+  
+  var prime = dashboardData.filter(s => s && s.score >= 7 && s.adx >= 20).length;
+  var highQuality = dashboardData.filter(s => s && s.score >= 8 && s.adx >= 25 && s.vol_ratio >= 1.2).length;
+  var longs = dashboardData.filter(s => s && s.direction === 'LONG').length;
+  var shorts = dashboardData.filter(s => s && s.direction === 'SHORT').length;
+  var swings = dashboardData.filter(s => s && s.recommended === 'SWING').length;
+  var intras = dashboardData.filter(s => s && s.recommended === 'INTRA').length;
+  var volSpikes = dashboardData.filter(s => s.vol_ratio >= 2).length;
+  
+  document.getElementById('h-prime').textContent = prime;
+  document.getElementById('dash-prime').textContent = highQuality + ' HIGH';
+  document.getElementById('h-long').textContent = longs;
+  document.getElementById('dash-long').textContent = longs;
+  document.getElementById('h-short').textContent = shorts;
+  document.getElementById('dash-short').textContent = shorts;
+  document.getElementById('nav-prime-badge').textContent = prime;
+  document.getElementById('scan-status').textContent = prime + ' prime';
+  
+  var longBias = longs + shorts > 0 ? (longs / (longs + shorts) * 100).toFixed(0) + '%' : '--';
+  document.getElementById('ml-accuracy').textContent = prime;
+  document.getElementById('ml-confidence').textContent = longBias;
+  document.getElementById('ml-trades').textContent = swings + ' / ' + intras;
+  document.getElementById('ml-pnl').textContent = volSpikes + ' spikes';
+  
+  var secMap = {};
+  dashboardData.forEach(function(s) {
+    if (!s || !s.sector) return;
+    if (!secMap[s.sector]) secMap[s.sector] = {total:0, long:0, short:0, prime:0, scores:[]};
+    var m = secMap[s.sector];
+    m.total++;
+    m.scores.push(s.score);
+    if (s.direction === 'LONG') m.long++; else m.short++;
+    if (s.score >= 7) m.prime++;
+  });
+  
+  var html = Object.keys(secMap).sort(function(a, b) {
+    var avgA = secMap[a].scores.reduce(function(x,y){return x+y},0) / secMap[a].scores.length;
+    var avgB = secMap[b].scores.reduce(function(x,y){return x+y},0) / secMap[b].scores.length;
+    return avgB - avgA;
+  }).map(function(sec) {
+    var m = secMap[sec];
+    var avg = m.scores.reduce(function(a,b){return a+b},0) / m.scores.length;
+    var bias = m.long > m.short ? 'bullish' : m.short > m.long ? 'bearish' : 'neutral';
+    var pct = (avg / 9) * 100;
+    return '<div class="sector-card ' + bias + '" onclick="loadSectorAnalysis(\'' + sec + '\')">' +
+      '<div class="sector-name">' + sec + '</div>' +
+      '<div class="sector-stats">' + m.total + ' stocks · ' + m.prime + ' prime · ' + m.long + '/' + m.short + '</div>' +
+      '<div class="sector-score">' + avg.toFixed(1) + '/9</div>' +
+      '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%;"></div></div>' +
+    '</div>';
+  }).join('');
+  
+  document.getElementById('sector-grid').innerHTML = html || '<div class="empty-state">No sectors</div>';
+  
+  var top = dashboardData.filter(s => s.score >= 7).slice(0, 8);
+  var topHtml = '';
+  top.forEach(function(s) {
+    var scoreClass = s.score >= 8 ? 'score-high' : s.score >= 7 ? 'score-mid' : 'score-low';
+    var dirColor = s.direction === 'LONG' ? '#10b981' : '#ef4444';
+    var price = s.live_price || s.current || 0;
+    var dirBg = s.direction === 'LONG' ? '#10b981' : '#ef4444';
+    var momentum = s.momentum_score || s.score * 10;
+    var confidence = s.ai_confidence || Math.round(momentum);
+    
+    topHtml += '<div class="top-signal-card" onclick="showStockDetail(\'' + s.symbol + '\')">';
+    topHtml += '<div style="display:flex;align-items:center;gap:12px;">';
+    topHtml += '<div class="score-ring ' + scoreClass + '">' + s.score + '</div>';
+    topHtml += '<div><div style="font-weight:700;font-size:16px;color:' + dirColor + ';">' + s.symbol + '</div>';
+    topHtml += '<div style="font-size:11px;color:#64748b;">' + (s.company || '') + '</div>';
+    topHtml += '<div style="font-size:10px;margin-top:4px;">';
+    topHtml += '<span style="background:#f0f9ff;color:#0284c7;padding:2px 6px;border-radius:4px;font-weight:600;">M:' + momentum + '</span> ';
+    topHtml += '<span style="background:#fef3c7;color:#d97706;padding:2px 6px;border-radius:4px;font-weight:600;">C:' + confidence + '%</span>';
+    topHtml += '</div></div></div>';
+    topHtml += '<div style="text-align:right;">';
+    topHtml += '<div style="font-family:JetBrains Mono;font-size:16px;font-weight:700;">₹' + price.toLocaleString('en-IN') + '</div>';
+    topHtml += '<div style="font-size:10px;color:#94a3b8;">' + (s.sector || '') + '</div>';
+    topHtml += '<div style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:9999px;background:' + dirBg + ';color:white;">' + s.direction + '</div>';
+    topHtml += '</div></div>';
+  });
+  
+  document.getElementById('top-signals').innerHTML = '<div class="top-signals-grid">' + (topHtml || '<div class="empty-state">No prime signals</div>') + '</div>';
+  showToast('Loaded from cache - ' + dashboardData.length + ' signals', 'success');
+}
+
+function renderScanner() {
+  if (stockData.length === 0) return;
+  document.getElementById('filtered-count').textContent = stockData.length;
+  filterStocks();
+  showToast('Loaded from cache - ' + stockData.length + ' stocks', 'success');
 }
 
 // ==================== MOMENTUM ====================
