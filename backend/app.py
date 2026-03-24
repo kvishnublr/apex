@@ -1,0 +1,1862 @@
+"""
+APEX NSE v7 — Flask Backend
+Pure Python. Requires: pip install flask kiteconnect
+Data source: Zerodha Kite API ONLY (historical + live LTP)
+No Yahoo Finance dependency
+Works on Python 3.9, 3.10, 3.11, 3.12, 3.13 — any version
+Run: python backend/app.py
+"""
+import sys, os, json, sqlite3, datetime, math, random, threading, time
+sys.path.insert(0, os.path.dirname(__file__))
+
+from flask import Flask, jsonify, request, send_file, Response, stream_with_context
+from engine import (
+    UNIVERSE, SECTORS, FILTER_NAMES, WIN_RATES,
+    gen_ohlcv, get_ohlcv, compute_indicators,
+    score_candle, compute_levels, run_backtest,
+    ENTRY_TIMES_OPEN, ENTRY_TIMES_POWER,
+)
+
+app  = Flask(__name__)
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB   = os.path.join(BASE, "../data/trades.db")
+CFG  = os.path.join(BASE, "../data/config.json")
+
+_cache = {}   # sym -> (rows, inds)
+
+# ── DATABASE ─────────────────────────────
+def get_db():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT, sector TEXT, direction TEXT, trade_type TEXT DEFAULT 'SWING',
+        entry_date TEXT, exit_date TEXT,
+        entry_price REAL, exit_price REAL, stop_loss REAL,
+        qty INTEGER, risk_inr REAL, charges REAL,
+        net_pnl REAL, actual_r REAL, exit_type TEXT,
+        score INTEGER, hold_days INTEGER, notes TEXT,
+        capital_before REAL, capital_after REAL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS signal_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_date TEXT, symbol TEXT, sector TEXT,
+        direction TEXT, score INTEGER, trade_type TEXT DEFAULT 'SWING',
+        entry REAL, sl REAL, t1 REAL, t2 REAL, t3 REAL,
+        adx REAL, rsi REAL, vol_ratio REAL,
+        filters TEXT, entry_time TEXT,
+        atr REAL DEFAULT 0,
+        live_price REAL DEFAULT 0,
+        risk_pct REAL DEFAULT 0,
+        status TEXT DEFAULT 'ACTIVE',
+        triggered_at TEXT,
+        pnl REAL DEFAULT 0,
+        logged_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS price_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT UNIQUE, date TEXT,
+        open_price REAL, high_price REAL, low_price REAL,
+        close_price REAL, volume INTEGER,
+        atr REAL DEFAULT 0, adx REAL DEFAULT 0, rsi REAL DEFAULT 0,
+        e20 REAL DEFAULT 0, e50 REAL DEFAULT 0, e200 REAL DEFAULT 0,
+        supertrend REAL DEFAULT 0,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(symbol, date)
+    );
+    CREATE TABLE IF NOT EXISTS live_prices (
+        symbol TEXT PRIMARY KEY,
+        price REAL DEFAULT 0,
+        prev_close REAL DEFAULT 0,
+        day_change_pct REAL DEFAULT 0,
+        volume INTEGER DEFAULT 0,
+        avg_volume REAL DEFAULT 0,
+        vol_ratio REAL DEFAULT 0,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS momentum_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT, company TEXT, sector TEXT,
+        alert_type TEXT,  -- 'BREAKOUT', 'SELLING', 'VOLUME_SPIKE', 'REVERSAL', 'MOMENTUM_SHIFT'
+        direction TEXT,    -- 'LONG' or 'SHORT'
+        price REAL, prev_price REAL, change_pct REAL,
+        vol_ratio REAL, score INTEGER,
+        entry_price REAL, sl REAL, t1 REAL, risk_per REAL,
+        adx REAL, rsi REAL,
+        acknowledged INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_signal_date ON signal_log(signal_date);
+    CREATE INDEX IF NOT EXISTS idx_signal_symbol ON signal_log(symbol);
+    CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_cache(symbol);
+    CREATE INDEX IF NOT EXISTS idx_alert_ack ON momentum_alerts(acknowledged);
+    """)
+    conn.commit(); conn.close()
+
+init_db()
+
+# ── DATABASE HELPERS ──────────────────────────
+
+def upsert_price(symbol, date, open_p, high_p, low_p, close_p, volume, indicators):
+    """Store/update price with indicators in cache."""
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO price_cache (symbol, date, open_price, high_price, low_price, close_price, volume, atr, adx, rsi, e20, e50, e200, supertrend, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(symbol, date) DO UPDATE SET
+            open_price=excluded.open_price, high_price=excluded.high_price,
+            low_price=excluded.low_price, close_price=excluded.close_price,
+            volume=excluded.volume, atr=excluded.atr, adx=excluded.adx,
+            rsi=excluded.rsi, e20=excluded.e20, e50=excluded.e50,
+            e200=excluded.e200, supertrend=excluded.supertrend,
+            updated_at=CURRENT_TIMESTAMP
+    """, (symbol, date, open_p, high_p, low_p, close_p, volume,
+          indicators.get("atr", 0), indicators.get("adx", 0),
+          indicators.get("rsi", 0), indicators.get("e20", 0),
+          indicators.get("e50", 0), indicators.get("e200", 0),
+          indicators.get("st", 0)))
+    conn.commit(); conn.close()
+
+def update_live_price(symbol, price, prev_close, volume, avg_vol):
+    """Update live price in DB."""
+    chg = round((price - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0
+    vr = round(volume / avg_vol, 2) if avg_vol > 0 else 1.0
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO live_prices (symbol, price, prev_close, day_change_pct, volume, avg_volume, vol_ratio, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(symbol) DO UPDATE SET
+            price=excluded.price, prev_close=excluded.prev_close,
+            day_change_pct=excluded.day_change_pct, volume=excluded.volume,
+            avg_volume=excluded.avg_volume, vol_ratio=excluded.vol_ratio,
+            updated_at=CURRENT_TIMESTAMP
+    """, (symbol, price, prev_close, chg, volume, avg_vol, vr))
+    conn.commit(); conn.close()
+
+def get_cached_price(symbol):
+    """Get latest cached price data from DB."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM live_prices WHERE symbol=?", (symbol,)).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
+def get_all_live_prices_db():
+    """Get all live prices from cache."""
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM live_prices ORDER BY vol_ratio DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def store_momentum_alert(alert_data):
+    """Store a momentum alert in DB."""
+    conn = get_db()
+    # Check if we already have a recent unacknowledged alert for this symbol
+    existing = conn.execute(
+        "SELECT id FROM momentum_alerts WHERE symbol=? AND acknowledged=0 AND created_at > datetime('now', '-5 minutes')",
+        (alert_data["symbol"],)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return  # Don't duplicate alerts within 5 minutes
+    conn.execute("""
+        INSERT INTO momentum_alerts (symbol, company, sector, alert_type, direction, price, prev_price, change_pct, vol_ratio, score, entry_price, sl, t1, risk_per, adx, rsi)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (alert_data["symbol"], alert_data["company"], alert_data["sector"],
+          alert_data["alert_type"], alert_data["direction"],
+          alert_data["price"], alert_data["prev_price"],
+          alert_data["change_pct"], alert_data["vol_ratio"],
+          alert_data["score"], alert_data["entry_price"],
+          alert_data["sl"], alert_data["t1"],
+          alert_data["risk_per"], alert_data["adx"],
+          alert_data["rsi"]))
+    conn.commit(); conn.close()
+
+def get_unacknowledged_alerts():
+    """Get all unacknowledged momentum alerts."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM momentum_alerts WHERE acknowledged=0 ORDER BY created_at DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def acknowledge_alert(alert_id):
+    conn = get_db()
+    conn.execute("UPDATE momentum_alerts SET acknowledged=1 WHERE id=?", (alert_id,))
+    conn.commit(); conn.close()
+
+def log_signal(signal_data):
+    """Store a signal in the log."""
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO signal_log (signal_date, symbol, sector, direction, score, trade_type,
+            entry, sl, t1, t2, t3, adx, rsi, vol_ratio, filters, entry_time, atr, live_price, risk_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (signal_data["date"], signal_data["symbol"], signal_data["sector"],
+          signal_data["direction"], signal_data["score"], signal_data.get("trade_type", "SWING"),
+          signal_data["entry"], signal_data["sl"], signal_data["t1"], signal_data["t2"], signal_data["t3"],
+          signal_data["adx"], signal_data["rsi"], signal_data["vol_ratio"],
+          json.dumps(signal_data["filters"]), signal_data.get("entry_time", "09:20"),
+          signal_data.get("atr", 0), signal_data.get("live_price", 0),
+          signal_data.get("risk_pct", 0)))
+    conn.commit(); conn.close()
+
+def get_signal_log(limit=100):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM signal_log ORDER BY logged_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# ── BACKGROUND SCANNER ──────────────────────────
+_scanner_running = False
+_scanner_thread = None
+
+def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk_pct, trade_type, meta, ind):
+    """Store stock analysis data for sector views and AI predictions."""
+    try:
+        conn = get_db()
+        now = datetime.datetime.now().isoformat()
+        
+        # Calculate momentum score based on multiple factors
+        adx = meta.get("adx", 0)
+        rsi = meta.get("rsi", 50)
+        vr = meta.get("vr", 1)
+        
+        # AI prediction score (0-100)
+        ai_score = min(100, int(score * 11.1))  # score 9 = 100
+        
+        # Confidence based on ADX and volume
+        confidence = min(95, int((adx / 30 * 40) + (vr / 3 * 40) + 20))
+        
+        # Momentum score
+        momentum = int((adx / 30 * 35) + (rsi / 100 * 25) + (vr / 2 * 25) + (score / 9 * 15))
+        
+        conn.execute("""
+            INSERT OR REPLACE INTO sector_analysis 
+            (sector, symbol, company, direction, score, live_price, entry_price, sl, t1, t2,
+             adx, rsi, vol_ratio, risk_pct, trade_type, ai_prediction, ai_confidence, momentum_score, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (info[3], sym, info[1], direction, score, live_price, levels["entry"],
+              levels["sl"], levels["t1"], levels["t2"], adx, rsi, vr, risk_pct, trade_type,
+              levels.get("t2", 0), confidence, momentum, now))
+        
+        conn.commit()
+        conn.close()
+        print(f"[STORE] {sym} -> sector_analysis (score={score}, momentum={momentum})")
+    except Exception as e:
+        print(f"[ERROR] _store_sector_analysis: {e}")
+
+def _generate_ai_predictions():
+    """Generate AI predictions for next movers based on stored analysis."""
+    try:
+        conn = get_db()
+        now = datetime.datetime.now().isoformat()
+        
+        # Get top stocks by momentum score
+        cur = conn.execute("""
+            SELECT symbol, sector, direction, live_price, t2, ai_confidence, momentum_score, 
+                   adx, rsi, vol_ratio, score
+            FROM sector_analysis 
+            WHERE score >= 6
+            ORDER BY momentum_score DESC LIMIT 20
+        """)
+        
+        stocks = cur.fetchall()
+        
+        for s in stocks:
+            sym, sector, direction, current, target, conf, momentum, adx, rsi, vr, score = s
+            
+            # AI reasoning based on indicators
+            reasoning_parts = []
+            if adx >= 25:
+                reasoning_parts.append(f"Strong trend (ADX:{adx})")
+            if rsi < 30:
+                reasoning_parts.append("Oversold - potential bounce")
+            elif rsi > 70:
+                reasoning_parts.append("Overbought - caution")
+            if vr >= 2:
+                reasoning_parts.append(f"High volume ({vr}x)")
+            if score >= 8:
+                reasoning_parts.append(f"High score ({score}/9)")
+            
+            reasoning = "; ".join(reasoning_parts) if reasoning_parts else "Analyzing..."
+            
+            # Predicted target (T2 from levels)
+            predicted_target = target if target else current * 1.05
+            
+            conn.execute("""
+                INSERT INTO ai_predictions 
+                (symbol, sector, direction, current_price, predicted_target, confidence, ai_score, reasoning, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (sym, sector, direction, current, predicted_target, conf, momentum, reasoning, now))
+        
+        conn.commit()
+        conn.close()
+        print(f"[AI] Generated predictions for {len(stocks)} stocks")
+    except Exception as e:
+        pass
+
+def _start_background_scanner():
+    """Start the background scanner in a separate thread."""
+    global _scanner_running, _scanner_thread
+    if _scanner_running:
+        return
+    _scanner_running = True
+    _scanner_thread = threading.Thread(target=_background_scanner_loop, daemon=True)
+    _scanner_thread.start()
+    print("[SCANNER] Background scanner started (60s interval)")
+
+def _background_scanner_loop():
+    """Continuously scan for momentum changes every 60 seconds."""
+    global _scanner_running
+    interval = 60  # seconds
+    last_full_scan = 0
+    
+    while _scanner_running:
+        try:
+            now = time.time()
+            
+            # Every 5 minutes, do a full universe scan + cache prices
+            if now - last_full_scan >= 300:
+                print(f"[BG-SCAN] Full scan at {datetime.datetime.now().strftime('%H:%M:%S')}...")
+                _full_universe_scan()
+                _generate_ai_predictions()  # Generate AI predictions
+                last_full_scan = now
+            
+            # Every cycle, check for momentum alerts using cached data
+            _check_momentum_alerts()
+            
+        except Exception as e:
+            print(f"[BG-SCAN] Error: {e}")
+        
+        time.sleep(interval)
+
+def _full_universe_scan():
+    """Full scan of all 207 stocks, cache prices + indicators."""
+    from engine import get_ohlcv, compute_indicators, score_candle, compute_levels, _train_models, _ml_trained
+    cfg = gcfg()
+    use_real = cfg.get("use_real", True)
+    
+    live_prices = get_zerodha_live_prices([u[0] for u in UNIVERSE])
+    
+    _ml_data_cache = {}
+    scanned_count = 0
+    
+    for info in UNIVERSE:
+        sym = info[0]
+        try:
+            rows = get_ohlcv(info, months=2, use_real=use_real)
+            if not rows or len(rows) < 30:
+                continue
+            
+            inds = compute_indicators(rows)
+            last = rows[-1]
+            ind = inds[-1]
+            
+            _ml_data_cache[sym] = rows
+            scanned_count += 1
+            
+            # Cache price data
+            upsert_price(sym, last["date"], last["open"], last["high"],
+                        last["low"], last["close"], last["volume"], ind)
+            
+            # Cache live price
+            lp = live_prices.get(sym, last["close"])
+            vol_window = [r["volume"] for r in rows[-21:-1]] if len(rows) >= 21 else [r["volume"] for r in rows[:-1]]
+            avg_vol = sum(vol_window) / len(vol_window) if vol_window else 1
+            update_live_price(sym, lp, last["close"], last["volume"], avg_vol)
+            
+            # Score and log signal
+            sc, direction, fl, meta = score_candle(last, ind)
+            if sc >= 5:
+                trade_type = meta.get("trend_quality", "SWING")
+                if meta.get("adx", 0) >= 22 and 35 <= meta.get("rsi", 50) <= 70:
+                    trade_type = "SWING"
+                elif meta.get("adx", 0) < 18 or meta.get("rsi", 0) > 75 or meta.get("rsi", 0) < 25:
+                    trade_type = "INTRA"
+                else:
+                    trade_type = "SWING"
+                
+                lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
+                risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
+                
+                signal_data = {
+                    "date": last["date"], "symbol": sym, "sector": info[3],
+                    "direction": direction, "score": sc,
+                    "trade_type": trade_type,
+                    "entry": lv["entry"], "sl": lv["sl"],
+                    "t1": lv["t1"], "t2": lv["t2"], "t3": lv["t3"],
+                    "adx": meta.get("adx", 0), "rsi": meta.get("rsi", 50),
+                    "vol_ratio": meta.get("vr", 1),
+                    "filters": fl,
+                    "entry_time": "09:20",
+                    "atr": ind.get("atr", 0),
+                    "live_price": lp,
+                    "risk_pct": risk_pct,
+                }
+                log_signal(signal_data)
+                
+        except Exception as e:
+            continue
+    
+    # Store ALL scanned stocks in sector_analysis (not just score >= 5)
+    for sym, data in _ml_data_cache.items():
+        try:
+            # Get stock info
+            info = next((x for x in UNIVERSE if x[0] == sym), None)
+            if not info:
+                continue
+            
+            # Get live price
+            lp = live_prices.get(sym, 0)
+            if lp <= 0:
+                continue
+            
+            # Get latest row and indicators
+            rows = data
+            if not rows or len(rows) < 30:
+                continue
+            last = rows[-1]
+            ind = compute_indicators(rows)[-1]
+            
+            sc, direction, fl, meta = score_candle(last, ind)
+            trade_type = meta.get("trend_quality", "SWING")
+            lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
+            risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
+            
+            _store_sector_analysis(info, sym, direction, sc, lv, lp, risk_pct, trade_type, meta, ind)
+        except:
+            continue
+    
+    if scanned_count > 0 and not _ml_trained:
+        print(f"[ML] Training models on {scanned_count} symbols...")
+        _train_models(_ml_data_cache)
+
+def _check_momentum_alerts():
+    """Check for sudden momentum changes using cached data."""
+    from engine import compute_indicators, score_candle, compute_levels
+    cfg = gcfg()
+    use_real = cfg.get("use_real", True)
+    
+    # Use cached live prices
+    cached_prices = get_all_live_prices_db()
+    if not cached_prices:
+        return
+    
+    # Get a few stocks with highest vol_ratio for alert check
+    top_spikes = sorted(cached_prices, key=lambda x: -x.get("vol_ratio", 0))[:30]
+    
+    for row in top_spikes:
+        sym = row["symbol"]
+        live_price = row.get("price", 0)
+        if live_price <= 0:
+            continue
+        
+        # Find company name
+        company = sym
+        sector = ""
+        for info in UNIVERSE:
+            if info[0] == sym:
+                company = info[2]
+                sector = info[3]
+                break
+        
+        try:
+            # Get recent data for scoring
+            for info in UNIVERSE:
+                if info[0] == sym:
+                    rows = get_ohlcv(info, months=1, use_real=use_real)
+                    if not rows or len(rows) < 10:
+                        continue
+                    
+                    inds = compute_indicators(rows)
+                    last = rows[-1]
+                    ind = inds[-1]
+                    
+                    sc, direction, fl, meta = score_candle(last, ind)
+                    adx = meta.get("adx", 0)
+                    rsi_val = meta.get("rsi", 50)
+                    vr = meta.get("vr", 1)
+                    chg_pct = row.get("day_change_pct", 0)
+                    
+                    # Determine alert type
+                    alert_type = None
+                    if adx >= 28 and vr >= 2.0 and abs(chg_pct) >= 1.0:
+                        alert_type = "BREAKOUT"
+                    elif chg_pct <= -2.0 and vr >= 1.8:
+                        alert_type = "SELLING"
+                    elif vr >= 2.5 and sc >= 6:
+                        alert_type = "VOLUME_SPIKE"
+                    elif (rsi_val <= 30 or rsi_val >= 70) and vr >= 1.5:
+                        alert_type = "REVERSAL"
+                    elif adx >= 25 and abs(chg_pct) >= 1.5 and sc >= 6:
+                        alert_type = "MOMENTUM_SHIFT"
+                    
+                    if alert_type and sc >= 5:
+                        trade_type = "SWING" if adx >= 22 else "INTRA"
+                        lv = compute_levels(live_price, ind.get("atr", live_price * 0.015), direction, trade_type)
+                        
+                        alert_data = {
+                            "symbol": sym, "company": company, "sector": sector,
+                            "alert_type": alert_type, "direction": direction,
+                            "price": live_price, "prev_price": row.get("prev_close", live_price),
+                            "change_pct": chg_pct, "vol_ratio": vr,
+                            "score": sc,
+                            "entry_price": lv["entry"], "sl": lv["sl"],
+                            "t1": lv["t1"], "risk_per": lv["risk_per"],
+                            "adx": adx, "rsi": rsi_val,
+                        }
+                        store_momentum_alert(alert_data)
+                    break
+        except Exception as e:
+            continue
+    
+    unack = get_unacknowledged_alerts()
+    if unack:
+        print(f"[ALERTS] {len(unack)} unacknowledged momentum alerts")
+
+# ── CONFIG ───────────────────────────────
+# Default: use REAL data from Zerodha
+DEFAULTS = {
+    "capital": 100000,
+    "risk_pct": 1.5,
+    "max_positions": 2,
+    "use_real": True,
+    # If Zerodha credentials exist, enable true LTP streaming.
+    # Uses Zerodha API for both historical and live data.
+    "use_zerodha_ltp": True,
+}
+
+def _load_simple_env_file():
+    """
+    Loads KEY=VALUE pairs from ../.env.txt (if present) into os.environ.
+    This is intentionally minimal to avoid extra dependencies.
+    """
+    root = os.path.join(BASE, "..")
+    env_path = os.path.join(root, ".env")
+    fallback_env_path = os.path.join(root, ".env.txt")
+    print(f"[ENV] Looking for .env in: {env_path}")
+    print(f"[ENV] .env exists: {os.path.exists(env_path)}")
+    if not os.path.exists(env_path):
+        env_path = fallback_env_path
+    if not os.path.exists(env_path):
+        return
+    print(f"[ENV] Loading from: {env_path}")
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        print(f"[ENV] Failed to load .env.txt: {e}")
+    print(f"[ENV] KITE_ACCESS_TOKEN = {os.environ.get('KITE_ACCESS_TOKEN', 'NOT SET')}")
+
+_load_simple_env_file()
+
+def gcfg():
+    try:
+        if os.path.exists(CFG):
+            with open(CFG) as f:
+                return {**DEFAULTS, **json.load(f)}
+    except Exception:
+        pass
+    return DEFAULTS.copy()
+
+def scfg(d):
+    os.makedirs(os.path.dirname(CFG), exist_ok=True)
+    with open(CFG, "w") as f:
+        json.dump(d, f, indent=2)
+
+
+# Start background scanner
+_start_background_scanner()
+
+# ── DATA HELPERS ─────────────────────────
+_cache_time = {}  # sym -> timestamp
+
+# ── REAL-TIME LTP (Zerodha streaming) ─────────────────────────────
+_ltp_cache = {}  # symbol -> {"ltp": float, "ts": unix_seconds, "fresh": bool}
+_ltp_lock = threading.Lock()
+_ltp_stream_thread_started = False
+_zerodha_ready = False
+
+def _maybe_start_zerodha_ltp_stream(run_in_main_thread=False):
+    global _ltp_stream_thread_started, _zerodha_ready
+    if _ltp_stream_thread_started:
+        return
+
+    cfg = gcfg()
+    if not cfg.get("use_zerodha_ltp", True):
+        return
+
+    api_key = os.environ.get("KITE_API_KEY", "").strip()
+    access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
+    # KITE_API_SECRET is not strictly required for streaming with access_token,
+    # but we load it anyway for completeness.
+    _ = os.environ.get("KITE_API_SECRET", "").strip()
+    if not api_key or not access_token:
+        return
+
+    _zerodha_ready = False
+    _ltp_stream_thread_started = True
+
+    def _worker():
+        nonlocal api_key, access_token
+        try:
+            from kiteconnect import KiteConnect, KiteTicker
+        except Exception as e:
+            print(f"[ZERODHA] kiteconnect not installed/available: {e}", flush=True)
+            return
+
+        try:
+            kite = KiteConnect(api_key=api_key)
+            kite.set_access_token(access_token)
+        except Exception as e:
+            print(f"[ZERODHA] Failed to init KiteConnect: {e}", flush=True)
+            return
+
+        print("[ZERODHA] Worker started", flush=True)
+
+        # Validate auth early so we don't spam reconnect attempts.
+        try:
+            print("[ZERODHA] Validating credentials (REST profile)...", flush=True)
+            _ = kite.profile()
+        except Exception as e:
+            global _zerodha_ready
+            _zerodha_ready = False
+            print(f"[ZERODHA] Auth failed (fix KITE_ACCESS_TOKEN): {e}", flush=True)
+            # Keep backend alive; Flask is running in another thread.
+            while True:
+                time.sleep(30)
+            return
+
+        # Build token map for our UNIVERSE symbols.
+        token_to_sym = {}
+        try:
+            print("[ZERODHA] Fetching instrument master for NSE...", flush=True)
+            instruments = kite.instruments("NSE")
+            inst_by_ts = {i.get("tradingsymbol"): i for i in instruments}
+
+            # Some symbols (like M&M) may be URL-encoded in Zerodha instruments.
+            from urllib.parse import quote
+            for sym in [u[0] for u in UNIVERSE]:
+                candidates = {sym, sym.replace("&", "%26")}
+                try:
+                    candidates.add(quote(sym, safe=""))
+                except Exception:
+                    pass
+
+                found = None
+                for c in candidates:
+                    if c in inst_by_ts:
+                        found = inst_by_ts[c]
+                        break
+                if found is None:
+                    continue
+                token_to_sym[int(found["instrument_token"])] = sym
+        except Exception as e:
+            print(f"[ZERODHA] Failed building instrument map: {e}", flush=True)
+            return
+
+        tokens = list(token_to_sym.keys())
+        if not tokens:
+            print("[ZERODHA] No instrument tokens resolved; skipping stream start.", flush=True)
+            return
+
+        # Mark stream as ready only after we have a token map.
+        _zerodha_ready = True
+
+        print(f"[ZERODHA] Streaming LTP for {len(tokens)} NSE tokens...", flush=True)
+
+        def on_connect(ws, response):
+            try:
+                ws.subscribe(tokens)
+                ws.set_mode(ws.MODE_LTP, tokens)
+            except Exception as e:
+                print(f"[ZERODHA] on_connect subscribe error: {e}")
+
+        def on_ticks(ws, ticks):
+            now = time.time()
+            with _ltp_lock:
+                for t in ticks:
+                    try:
+                        token = int(t.get("instrument_token"))
+                        sym = token_to_sym.get(token)
+                        if not sym:
+                            continue
+                        ltp = t.get("last_price")
+                        if ltp is None:
+                            continue
+                        ltp = float(ltp)
+                        if ltp <= 0:
+                            continue
+                        _ltp_cache[sym] = {"ltp": ltp, "ts": now, "fresh": True}
+                    except Exception:
+                        continue
+
+        def on_close(ws, code, reason):
+            print(f"[ZERODHA] WebSocket closed: code={code} reason={reason}")
+
+        def on_error(ws, code, reason):
+            print(f"[ZERODHA] WebSocket error: code={code} reason={reason}")
+
+        # Reconnect loop: kite ticker "connect" may return on disconnect.
+        while True:
+            try:
+                kws = KiteTicker(api_key, access_token)
+                kws.on_ticks = on_ticks
+                kws.on_connect = on_connect
+                kws.on_close = on_close
+                kws.on_error = on_error
+                kws.connect(threaded=False)
+            except Exception as e:
+                print(f"[ZERODHA] Stream exception: {e}")
+            # Backoff before retry
+            time.sleep(3)
+
+    if run_in_main_thread:
+        # IMPORTANT: kiteconnect may use Twisted and tries to install signal handlers.
+        # That breaks when executed in a non-main thread on Windows.
+        _worker()
+    else:
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+def _zerodha_stream_active():
+    # Stream is considered "available" if creds were present and the stream thread started.
+    return _zerodha_ready
+
+def _fresh_ltps(now_ts, max_age_sec=2.5):
+    """
+    Returns a snapshot list of all symbols with prices (freshness optional).
+    SSE caller will throttle by itself.
+    """
+    updates = []
+    with _ltp_lock:
+        for sym, v in _ltp_cache.items():
+            ltp = v.get("ltp")
+            ts = v.get("ts")
+            if ltp is None or ts is None:
+                continue
+            fresh = (now_ts - float(ts)) <= max_age_sec
+            updates.append({"symbol": sym, "ltp": float(ltp), "ts": ts, "fresh": fresh})
+    return updates
+
+# Start Zerodha streaming later (inside __main__) to keep Twisted happy.
+
+def get_stock(sym, use_real=None, force_refresh=False):
+    cfg = gcfg()
+    if use_real is None:
+        use_real = cfg.get("use_real", True)
+    
+    # Cache for 5 minutes if using real data, always refresh if force_refresh
+    import time
+    now = time.time()
+    cache_ttl = 300  # 5 minutes
+    if sym in _cache and not force_refresh:
+        if use_real and sym in _cache_time and (now - _cache_time[sym]) < cache_ttl:
+            return _cache[sym]
+        elif not use_real:
+            return _cache[sym]
+    
+    info = next((x for x in UNIVERSE if x[0] == sym), None)
+    if not info:
+        print(f"[WARN] Symbol not found: {sym}")
+        return None, None
+    
+    print(f"[DATA] Fetching {'REAL' if use_real else 'SYNTHETIC'} data for {sym}...")
+    rows = get_ohlcv(info, months=9, use_real=use_real)
+    if not rows or len(rows) < 30:
+        print(f"[WARN] No data for {sym}: got {len(rows) if rows else 0} rows, falling back to synthetic")
+        rows = gen_ohlcv(info, months=9)  # Fallback to synthetic
+    try:
+        inds = compute_indicators(rows)
+    except Exception as e:
+        print(f"[ERROR] Indicators failed for {sym}: {e}")
+        return None, None
+    _cache[sym] = (rows, inds)
+    _cache_time[sym] = now
+    print(f"[DATA] Got {len(rows)} rows for {sym}, latest: {rows[-1]['date'] if rows else 'N/A'}")
+    return rows, inds
+
+def clear_cache():
+    global _cache, _cache_time
+    _cache = {}
+    _cache_time = {}
+    print("[CACHE] Cleared")
+
+def make_signal(sym, info, rows, inds, idx, sc, dr, fl, meta, entry_time=None):
+    rnd = random.Random(hash(sym + rows[idx]["date"]))
+    if entry_time is None:
+        entry_time = rnd.choice(ENTRY_TIMES_OPEN if rnd.random() < 0.65 else ENTRY_TIMES_POWER)
+    lv = compute_levels(rows[idx]["close"], inds[idx]["atr"], dr)
+    
+    # Determine swing vs intra suitability (enhanced)
+    adx = meta.get("adx", 0)
+    rsi = meta.get("rsi", 50)
+    vr = meta.get("vr", 1)
+    trend_q = meta.get("trend_quality", "WEAK")
+    entry_q = meta.get("entry_quality", "NORMAL")
+    
+    # SWING: Strong trend (ADX >= 22) + moderate momentum (RSI 35-70) + good trend quality
+    # INTRA: Weak trend (ADX < 18) + extreme RSI (>75 or <25)
+    if adx >= 22 and 35 <= rsi <= 70 and trend_q in ["STRONG", "MODERATE"]:
+        recommended = "SWING"
+        confidence = "HIGH"
+    elif adx >= 20 and 30 <= rsi <= 75 and trend_q != "WEAK":
+        recommended = "SWING"
+        confidence = "MEDIUM"
+    elif adx < 15 or rsi > 80 or rsi < 20:
+        recommended = "INTRA"
+        confidence = "HIGH"
+    elif adx >= 18 and (rsi >= 70 or rsi <= 30):
+        recommended = "INTRA"
+        confidence = "MEDIUM"
+    elif entry_q == "IDEAL" and adx >= 18:
+        recommended = "SWING"
+        confidence = "HIGH"
+    else:
+        recommended = "SWING"  # Default to swing for more opportunities
+        confidence = "MEDIUM"
+    
+    # Price change analysis (with safety checks)
+    current_price = rows[idx]["close"]
+    prev_close = rows[idx-1]["close"] if idx > 0 and rows[idx-1]["close"] > 0 else current_price
+    day_change = ((current_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+    
+    # 52-week analysis (using last 60 days as proxy) - with safety
+    recent = rows[max(0,idx-60):idx+1]
+    if recent:
+        high_60 = max(r["high"] for r in recent)
+        low_60 = min(r["low"] for r in recent)
+        pct_from_high = ((high_60 - current_price) / high_60 * 100) if high_60 > 0 else 0
+        pct_from_low = ((current_price - low_60) / low_60 * 100) if low_60 > 0 else 0
+    else:
+        high_60 = low_60 = current_price
+        pct_from_high = pct_from_low = 0
+    
+    # Volume analysis (with safety)
+    vol_today = rows[idx]["volume"]
+    vol_window = rows[max(0,idx-20):idx]
+    vol_avg = sum(r["volume"] for r in vol_window) / len(vol_window) if vol_window else 1
+    vol_spike = vol_today / vol_avg if vol_avg > 0 else 1
+    
+    return {
+        "date":           rows[idx]["date"],
+        "symbol":         sym,
+        "company":        info[2],
+        "sector":         info[3],
+        "direction":      dr,
+        "score":          sc,
+        "filters":        fl,
+        
+        # Price data
+        "entry":          lv["entry"],
+        "current":       current_price,
+        "prev_close":    prev_close,
+        "day_change_pct": round(day_change, 2),
+        "high":           rows[idx]["high"],
+        "low":            rows[idx]["low"],
+        "sl":             lv["sl"],
+        "t1":             lv["t1"],
+        "t2":             lv["t2"],
+        "t3":             lv["t3"],
+        "risk_per":       lv["risk_per"],
+        "atr":            lv["atr"],
+        
+        # Current state
+        "close":          current_price,
+        "volume":         rows[idx]["volume"],
+        
+        # Indicators
+        "adx":            meta["adx"],
+        "rsi":            meta["rsi"],
+        "vol_ratio":      meta["vr"],
+        "vol_spike":      round(vol_spike, 2),
+        "st":             meta["st"],
+        
+        # Technical levels
+        "entry_time":     entry_time,
+        "entry_datetime": f"{rows[idx]['date']} {entry_time} IST",
+        "bb_up":          inds[idx]["bb_up"],
+        "bb_lo":          inds[idx]["bb_lo"],
+        "supertrend":     inds[idx]["st"],
+        "e20":            inds[idx]["e20"],
+        "e50":            inds[idx]["e50"],
+        "e200":           inds[idx]["e200"],
+        
+        # Recommendations
+        "recommended":    recommended,
+        "confidence":     confidence,
+        
+        # Position analysis
+        "pct_from_high": round(pct_from_high, 1),
+        "pct_from_low":  round(pct_from_low, 1),
+        "high_60d":      round(high_60, 2),
+        "low_60d":       round(low_60, 2),
+        
+        # Quick entry flags
+        "is_breakout":    adx >= 28 and vr >= 1.5,
+        "is_volume_spike": vol_spike >= 2.0,
+        "is_reversal":    rsi > 65 or rsi < 35,
+        "is_momentum":   adx >= 25 and sc >= 6,
+    }
+
+# ── CORS ─────────────────────────────────
+@app.after_request
+def cors(r):
+    r.headers["Access-Control-Allow-Origin"]  = "*"
+    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    r.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+    return r
+
+# ── ROUTES ───────────────────────────────
+@app.route("/", defaults={"p": ""})
+@app.route("/<path:p>")
+def root(p):
+    fp = os.path.join(BASE, "../frontend/index.html")
+    return send_file(fp) if os.path.exists(fp) else ("<h2>Frontend missing</h2>", 200)
+
+@app.route("/api/status")
+def status():
+    cfg = gcfg()
+    has_zerodha = bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
+    
+    # Get sector stats from database
+    sector_stats = {}
+    try:
+        conn = get_db()
+        cur = conn.execute("""
+            SELECT sector, COUNT(*) as count, AVG(score) as avg_score, AVG(momentum_score) as avg_momentum
+            FROM sector_analysis 
+            WHERE score >= 5
+            GROUP BY sector
+            ORDER BY avg_momentum DESC
+        """)
+        for row in cur.fetchall():
+            sector_stats[row[0]] = {"count": row[1], "avg_score": round(row[2], 1), "avg_momentum": round(row[3], 1)}
+        conn.close()
+    except:
+        pass
+    
+    return jsonify({
+        "ok":           True,
+        "version":      "7.0",
+        "python":       sys.version.split()[0],
+        "capital":      cfg["capital"],
+        "zerodha":      has_zerodha,
+        "data_mode":    "REAL (Zerodha)" if cfg.get("use_real") else "SYNTHETIC",
+        "universe":     len(UNIVERSE),
+        "cached":       len(_cache),
+        "sectors":      SECTORS,
+        "filter_names": FILTER_NAMES,
+        "sector_stats": sector_stats,
+        "ts":           datetime.datetime.now().isoformat(),
+    })
+
+@app.route("/api/sector/<sector>")
+def get_sector_stocks(sector):
+    """Get detailed analysis for all stocks in a sector."""
+    conn = get_db()
+    cur = conn.execute("""
+        SELECT symbol, company, direction, score, live_price, entry_price, sl, t1, t2,
+               adx, rsi, vol_ratio, risk_pct, trade_type, ai_prediction, ai_confidence, 
+               momentum_score, updated_at
+        FROM sector_analysis 
+        WHERE sector = ? AND score >= 5
+        ORDER BY momentum_score DESC
+    """, (sector,))
+    
+    stocks = []
+    for row in cur.fetchall():
+        stocks.append({
+            "symbol": row[0], "company": row[1], "direction": row[2], "score": row[3],
+            "live_price": row[4], "entry_price": row[5], "sl": row[6], "t1": row[7], "t2": row[8],
+            "adx": row[9], "rsi": row[10], "vol_ratio": row[11], "risk_pct": row[12],
+            "trade_type": row[13], "ai_target": row[14], "ai_confidence": row[15],
+            "momentum_score": row[16], "updated_at": row[17]
+        })
+    
+    conn.close()
+    return jsonify({"sector": sector, "stocks": stocks, "count": len(stocks)})
+
+@app.route("/api/ai-predictions")
+def get_ai_predictions():
+    """Get AI predicted next movers."""
+    conn = get_db()
+    cur = conn.execute("""
+        SELECT symbol, sector, direction, current_price, predicted_target, confidence, ai_score, reasoning, created_at
+        FROM ai_predictions 
+        ORDER BY confidence DESC LIMIT 20
+    """)
+    
+    predictions = []
+    for row in cur.fetchall():
+        predictions.append({
+            "symbol": row[0], "sector": row[1], "direction": row[2],
+            "current_price": row[3], "predicted_target": row[4],
+            "confidence": row[5], "ai_score": row[6], "reasoning": row[7], "created_at": row[8]
+        })
+    
+    conn.close()
+    return jsonify({"predictions": predictions, "count": len(predictions)})
+
+@app.route("/api/config", methods=["GET", "POST"])
+def config_route():
+    if request.method == "POST":
+        cfg = gcfg()
+        cfg.update(request.json or {})
+        scfg(cfg)
+        clear_cache()
+        return jsonify({"ok": True})
+    return jsonify(gcfg())
+
+@app.route("/api/refresh", methods=["POST"])
+def refresh_data():
+    """Force refresh all data from Zerodha"""
+    clear_cache()
+    cfg = gcfg()
+    cfg["use_real"] = True
+    scfg(cfg)
+    return jsonify({"ok": True, "message": "Cache cleared, using REAL data from Yahoo Finance"})
+
+@app.route("/api/ltp-stream")
+def ltp_stream():
+    """
+    Server-Sent Events (SSE) endpoint.
+    Streams an array of {symbol, ltp, ts, fresh} about once per second.
+    """
+    def _gen():
+        last_yield = 0.0
+        while True:
+            try:
+                now_ts = time.time()
+                # Throttle to ~1 update/sec
+                if now_ts - last_yield < 1.0:
+                    time.sleep(0.25)
+                    continue
+                last_yield = now_ts
+
+                updates = []
+                if _zerodha_stream_active():
+                    updates = _fresh_ltps(now_ts=now_ts, max_age_sec=2.5)
+
+                payload = {
+                    "ts": datetime.datetime.now().isoformat(),
+                    "updates": updates,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+            except GeneratorExit:
+                return
+            except Exception as e:
+                # Avoid killing the SSE stream on transient errors.
+                try:
+                    payload = {"ts": datetime.datetime.now().isoformat(), "updates": [], "error": str(e)}
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except Exception:
+                    return
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return Response(stream_with_context(_gen()), mimetype="text/event-stream", headers=headers)
+
+def get_live_price(symbol):
+    """Get current/live price for a stock from Zerodha"""
+    prices = get_zerodha_live_prices([symbol])
+    return prices.get(symbol)
+
+_zerodha_kite_instance = None
+
+def _get_zerodha_kite():
+    """Get or create a KiteConnect instance for REST API calls."""
+    global _zerodha_kite_instance
+    if _zerodha_kite_instance is not None:
+        return _zerodha_kite_instance
+    
+    api_key = os.environ.get("KITE_API_KEY", "").strip()
+    access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
+    if not api_key or not access_token:
+        return None
+    
+    try:
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+        _zerodha_kite_instance = kite
+        return kite
+    except Exception as e:
+        print(f"[ZERODHA] Failed to create KiteConnect: {e}")
+        return None
+
+def get_zerodha_live_prices(symbols, retries=3):
+    """
+    Robust Zerodha LTP fetcher with retry + exponential backoff.
+    Falls back to DB cache if Zerodha fails.
+    """
+    api_key = os.environ.get("KITE_API_KEY", "").strip()
+    access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
+    
+    if not api_key or not access_token:
+        print("[ZERODHA] No credentials found")
+        return _get_from_db_cache(symbols)
+    
+    result = {}
+    
+    for attempt in range(retries):
+        try:
+            kite = _get_zerodha_kite()
+            if not kite:
+                break
+            
+            instruments = kite.instruments("NSE")
+            inst_map = {i["tradingsymbol"]: i["instrument_token"] for i in instruments}
+            
+            tokens = []
+            sym_map = {}
+            for sym in symbols:
+                for cand in [sym, sym.replace("&", "%26")]:
+                    if cand in inst_map:
+                        t = inst_map[cand]
+                        tokens.append(t)
+                        sym_map[t] = sym
+                        break
+            
+            if not tokens:
+                print("[ZERODHA] No tokens matched")
+                return _get_from_db_cache(symbols)
+            
+            ltp_data = kite.ltp(tokens)
+            for tok_str, data in ltp_data.items():
+                tok = int(tok_str)
+                sym = sym_map.get(tok)
+                if sym and data.get("last_price"):
+                    result[sym] = round(float(data["last_price"]), 2)
+            
+            print(f"[ZERODHA] Got prices for {len(result)}/{len(symbols)} symbols (attempt {attempt+1})")
+            return result
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            if "access token" in err_str or "incorrect" in err_str:
+                print(f"[ZERODHA] AUTH FAILED: {e}")
+                return _get_from_db_cache(symbols)
+            wait = 2 ** attempt
+            print(f"[ZERODHA] Attempt {attempt+1} failed: {e}. Retrying in {wait}s...")
+            if attempt < retries - 1:
+                time.sleep(wait)
+    
+    print(f"[ZERODHA] All {retries} attempts failed. Using DB cache.")
+    return _get_from_db_cache(symbols)
+
+def _get_from_db_cache(symbols):
+    """Fallback: get prices from local DB cache."""
+    result = {}
+    for sym in symbols:
+        cached = get_cached_price(sym)
+        if cached and cached.get("price", 0) > 0:
+            result[sym] = round(float(cached["price"]), 2)
+    print(f"[CACHE] Got {len(result)} prices from DB cache")
+    return result
+
+@app.route("/api/scanner-cached")
+def scanner_cached():
+    """Get cached scanner results from database (fast, no re-scan)"""
+    ms = int(request.args.get("min_score", 0))
+    sec = request.args.get("sector", "")
+    dr = request.args.get("direction", "")
+    rec = request.args.get("type", "")
+    quality = request.args.get("quality", "all")  # all, prime, high
+    
+    conn = get_db()
+    
+    # Base query
+    query = """
+        SELECT symbol, company, sector, direction, score, live_price, entry_price, 
+               sl, t1, t2, adx, rsi, vol_ratio, risk_pct, trade_type, 
+               ai_prediction, ai_confidence, momentum_score, updated_at
+        FROM sector_analysis 
+        WHERE score >= ?
+    """
+    params = [ms]
+    
+    # Add quality filters for more trustworthy signals
+    if quality == "prime":
+        query += " AND score >= 7 AND adx >= 20 AND vol_ratio >= 1.0"
+    elif quality == "high":
+        query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.5"
+    
+    if sec:
+        query += " AND sector = ?"
+        params.append(sec)
+    if dr:
+        query += " AND direction = ?"
+        params.append(dr)
+    if rec:
+        query += " AND trade_type = ?"
+        params.append(rec)
+    
+    query += " ORDER BY score DESC, momentum_score DESC"
+    
+    cur = conn.execute(query, params)
+    out = []
+    for row in cur.fetchall():
+        out.append({
+            "symbol": row[0], "company": row[1], "sector": row[2], "direction": row[3],
+            "score": row[4], "live_price": row[5], "entry": row[6], "sl": row[7],
+            "t1": row[8], "t2": row[9], "adx": row[10], "rsi": row[11],
+            "vol_ratio": row[12], "risk_pct": row[13], "recommended": row[14],
+            "ai_target": row[15], "ai_confidence": row[16], "momentum_score": row[17],
+            "updated_at": row[18]
+        })
+    conn.close()
+    
+    # Fetch latest live prices for update
+    live_prices = get_all_live_prices_db()
+    price_map = {r["symbol"]: r["price"] for r in live_prices}
+    
+    for s in out:
+        if s["symbol"] in price_map:
+            s["live_price"] = price_map[s["symbol"]]
+    
+    return jsonify({"stocks": out, "total": len(out), "cached": True})
+
+@app.route("/api/scanner")
+def scanner():
+    ms  = int(request.args.get("min_score", 0))
+    sec = request.args.get("sector", "")
+    dr  = request.args.get("dir", "")
+    rec = request.args.get("type", "")  # SWING, INTRA, or empty for all
+    refresh = request.args.get("refresh", "0") == "1"
+    cfg = gcfg()
+    use_zerodha = cfg.get("use_zerodha_ltp", True) and bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
+    out = []
+    skipped = []
+    use_real = cfg.get("use_real", True)
+    print(f"[SCANNER] Starting scan (min_score={ms}, type={rec}, use_real={use_real}, refresh={refresh})...")
+    print(f"[SCANNER] Today's date: {datetime.date.today()}")
+    
+    # Pre-fetch live prices from Zerodha
+    zerodha_live_prices = {}
+    if use_zerodha:
+        print(f"[SCANNER] use_zerodha=True, fetching live prices...")
+        zerodha_live_prices = get_zerodha_live_prices([u[0] for u in UNIVERSE])
+        print(f"[SCANNER] Got live prices for {len(zerodha_live_prices)} symbols")
+        print(f"[SCANNER] TATAELXSI live: {zerodha_live_prices.get('TATAELXSI')}")
+    else:
+        print("[SCANNER] use_zerodha=False - Zerodha not available")
+    
+    for info in UNIVERSE:
+        sym = info[0]
+        yf_ticker = info[1]
+        if sec and info[3] != sec: continue
+        try:
+            rows, inds = get_stock(sym, use_real=use_real, force_refresh=refresh)
+            if not rows or len(rows) < 30:
+                skipped.append((sym, "no data"))
+                continue
+            
+            # Get live price from Zerodha
+            live_price = zerodha_live_prices.get(sym)
+            last_date = rows[-1]["date"]
+            last_close = rows[-1]["close"]
+            src = "ZERODHA" if live_price else "NONE"
+            print(f"[LIVE] {sym}: {src}={live_price}, last_close={last_close}")
+            
+            sc, direction, fl, meta = score_candle(rows[-1], inds[-1])
+            if sc < ms:
+                skipped.append((sym, f"low score {sc}"))
+                continue
+            if dr and direction != dr:
+                skipped.append((sym, f"wrong dir {direction}"))
+                continue
+            signal = make_signal(sym, info, rows, inds, -1, sc, direction, fl, meta)
+            
+            # Filter by recommendation type
+            if rec and signal.get("recommended") != rec:
+                skipped.append((sym, f"wrong type {signal.get('recommended')}"))
+                continue
+            
+            # Determine trade type for proper level calculation
+            trade_type = signal.get("recommended", "SWING")
+            
+            # Override with live price if available
+            if live_price:
+                lv = compute_levels(live_price, inds[-1]["atr"], direction, trade_type)
+                risk_pct = round(lv["risk_per"] / live_price * 100, 2)
+                prev_close = rows[-1]["close"]
+                day_chg = round((live_price - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0
+                signal["current"] = live_price
+                signal["live_price"] = live_price
+                signal["entry"] = lv["entry"]
+                signal["sl"] = lv["sl"]
+                signal["t1"] = lv["t1"]
+                signal["t2"] = lv["t2"]
+                signal["t3"] = lv["t3"]
+                signal["risk_per"] = lv["risk_per"]
+                signal["atr"] = lv["atr"]
+                signal["trade_type"] = trade_type
+                signal["risk_pct"] = risk_pct
+                signal["day_change_pct"] = day_chg
+                signal["data_date"] = last_date + " + LIVE"
+            else:
+                # No live price — use historical close as base price
+                base_price = rows[-1]["close"]
+                atr_val = inds[-1]["atr"]
+                lv = compute_levels(base_price, atr_val, direction, trade_type)
+                risk_pct = round(lv["risk_per"] / base_price * 100, 2)
+                signal["current"] = base_price
+                signal["live_price"] = base_price
+                signal["entry"] = lv["entry"]
+                signal["sl"] = lv["sl"]
+                signal["t1"] = lv["t1"]
+                signal["t2"] = lv["t2"]
+                signal["t3"] = lv["t3"]
+                signal["risk_per"] = lv["risk_per"]
+                signal["atr"] = lv["atr"]
+                signal["trade_type"] = trade_type
+                signal["risk_pct"] = risk_pct
+                signal["day_change_pct"] = 0.0
+                signal["data_date"] = last_date
+            
+            out.append(signal)
+            
+            # Store in sector_analysis for detailed stock analysis
+            try:
+                ind = inds[-1]
+                _store_sector_analysis(info, sym, direction, sc, {
+                    "entry": signal.get("entry", 0),
+                    "sl": signal.get("sl", 0),
+                    "t1": signal.get("t1", 0),
+                    "t2": signal.get("t2", 0)
+                }, live_price, signal.get("risk_pct", 0), trade_type, meta, ind)
+            except Exception as e:
+                print(f"[STORE ERROR] {sym}: {e}")
+                
+        except Exception as e:
+            print(f"[ERROR] {sym}: {e}")
+            skipped.append((sym, str(e)))
+            continue
+    
+    out.sort(key=lambda x: (-x["score"], -x["adx"]))
+    print(f"[SCANNER] Found {len(out)} signals, scanned {len(UNIVERSE)} stocks, skipped {len(skipped)}")
+    return jsonify({"stocks": out, "total": len(out), "scanned": len(UNIVERSE), "skipped": skipped[:10]})
+
+@app.route("/api/signals")
+def signals():
+    ms    = int(request.args.get("min_score", 5))
+    today = str(datetime.date.today())
+    cfg   = gcfg()
+    out   = []
+    skipped = []
+    rnd   = random.Random(42)
+    use_real = cfg.get("use_real", True)
+    for info in UNIVERSE:
+        sym = info[0]
+        try:
+            rows, inds = get_stock(sym, use_real=use_real)
+            if not rows or len(rows) < 30:
+                skipped.append((sym, "no data"))
+                continue
+            sc, dr, fl, meta = score_candle(rows[-1], inds[-1])
+            if sc < ms:
+                skipped.append((sym, f"low score {sc}"))
+                continue
+            t   = rnd.choice(ENTRY_TIMES_OPEN if rnd.random() < 0.65 else ENTRY_TIMES_POWER)
+            sig = make_signal(sym, info, rows, inds, -1, sc, dr, fl, meta, t)
+            out.append(sig)
+        except Exception as e:
+            skipped.append((sym, str(e)))
+            continue
+    out.sort(key=lambda x: (-x["score"], -x["adx"]))
+    # Log signals with live_price
+    conn = get_db()
+    for s in out[:25]:
+        conn.execute(
+            "INSERT INTO signal_log(signal_date,symbol,sector,direction,score,"
+            "entry,sl,t1,t2,t3,adx,rsi,vol_ratio,filters,entry_time,live_price,trade_type,atr,risk_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (today, s["symbol"], s["sector"], s["direction"], s["score"],
+             s["entry"], s["sl"], s["t1"], s["t2"], s["t3"],
+             s["adx"], s["rsi"], s["vol_ratio"],
+             json.dumps(s["filters"]), s["entry_time"], s.get("live_price", 0),
+             s.get("trade_type", "SWING"), s.get("atr", 0), s.get("risk_pct", 0))
+        )
+    conn.commit(); conn.close()
+    return jsonify({
+        "signals":      out,
+        "count":        len(out),
+        "min_score":    ms,
+        "date":         today,
+        "filter_names": FILTER_NAMES,
+        "skipped":      skipped[:10],
+    })
+
+@app.route("/api/history/<sym>")
+def history(sym):
+    ms  = int(request.args.get("min_score", 5))
+    cfg = gcfg()
+    rnd = random.Random(42)
+    use_real = cfg.get("use_real", False)
+    try:
+        rows, inds = get_stock(sym, use_real=use_real)
+        info = next((x for x in UNIVERSE if x[0] == sym), None)
+        if not rows or not info:
+            return jsonify({"error": "Symbol not found"}), 404
+        sigs  = []
+        ohlcv = []
+        start = max(60, len(rows) - 180)
+        for i in range(start, len(rows)):
+            sc, dr, fl, meta = score_candle(rows[i], inds[i])
+            if sc >= ms:
+                t = rnd.choice(ENTRY_TIMES_OPEN if rnd.random() < 0.65 else ENTRY_TIMES_POWER)
+                sigs.append(make_signal(sym, info, rows, inds, i, sc, dr, fl, meta, t))
+            ohlcv.append({
+                "date":      rows[i]["date"],
+                "open":      rows[i]["open"],
+                "high":      rows[i]["high"],
+                "low":       rows[i]["low"],
+                "close":     rows[i]["close"],
+                "volume":    rows[i]["volume"],
+                "adx":       inds[i]["adx"],
+                "rsi":       inds[i]["rsi"],
+                "e20":       inds[i]["e20"],
+                "e50":       inds[i]["e50"],
+                "e200":      inds[i]["e200"],
+                "st":        inds[i]["st"],
+                "st_dir":    inds[i]["st_dir"],
+                "bb_up":     inds[i]["bb_up"],
+                "bb_lo":     inds[i]["bb_lo"],
+                "vr":        inds[i]["vr"],
+                "macd_hist": inds[i]["macd_hist"],
+                "dip":       inds[i]["dip"],
+                "dim":       inds[i]["dim"],
+                "vwap":      inds[i]["vwap"],
+                "atr_rk":    inds[i]["atr_rk"],
+            })
+        return jsonify({"sym": sym, "signals": sigs, "ohlcv": ohlcv, "total": len(sigs)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/backtest", methods=["POST"])
+def backtest_route():
+    params  = request.json or {}
+    cfg     = gcfg()
+    months  = int(params.get("months", 6))
+    syms    = params.get("symbols", [u[0] for u in UNIVERSE])
+    trade_type = params.get("trade_type", "ALL")  # SWING, INTRA, or ALL
+    use_real = cfg.get("use_real", False)
+    print(f"[BT] Loading {len(syms)} stocks (use_real={use_real}, type={trade_type})...")
+    stock_data = []
+    for info in UNIVERSE:
+        if info[0] not in syms: continue
+        try:
+            rows = get_ohlcv(info, months=months + 3, use_real=use_real)
+            if not rows or len(rows) < 30:
+                continue
+            inds = compute_indicators(rows)
+            stock_data.append((info, rows, inds))
+        except Exception as e:
+            print(f"  skip {info[0]}: {e}")
+    print(f"[BT] Running on {len(stock_data)} stocks...")
+    result = run_backtest(stock_data, params)
+    return jsonify(result)
+
+@app.route("/api/oi-spikes")
+def oi_spikes():
+    """
+    Detect unusual volume/activity spikes across the universe.
+    Uses volume ratio vs 20-day average as a proxy for OI concentration.
+    Returns top stocks with unusual activity, sorted by spike intensity.
+    """
+    cfg = gcfg()
+    use_real = cfg.get("use_real", True)
+    zerodha_live = {}
+    
+    try:
+        kite = _get_zerodha_kite()
+        if kite:
+            instruments = kite.instruments("NSE")
+            inst_map = {i["tradingsymbol"]: i["instrument_token"] for i in instruments}
+            tokens = []
+            sym_map = {}
+            for info in UNIVERSE:
+                sym = info[0]
+                for cand in [sym, sym.replace("&", "%26")]:
+                    if cand in inst_map:
+                        t = inst_map[cand]
+                        tokens.append(t)
+                        sym_map[t] = sym
+                        break
+            if tokens:
+                ltp_data = kite.ltp(tokens)
+                for tok_str, d in ltp_data.items():
+                    sym = sym_map.get(int(tok_str))
+                    if sym and d.get("last_price"):
+                        zerodha_live[sym] = round(float(d["last_price"]), 2)
+    except Exception as e:
+        print(f"[OI] Zerodha live error: {e}")
+    
+    results = []
+    
+    for info in UNIVERSE:
+        sym = info[0]
+        try:
+            rows = get_ohlcv(info, months=2, use_real=use_real)
+            if not rows or len(rows) < 5:
+                continue
+            
+            last = rows[-1]
+            prev_close = rows[-2]["close"] if len(rows) >= 2 else last["close"]
+            
+            vol_window = [r["volume"] for r in rows[-21:-1]] if len(rows) >= 21 else [r["volume"] for r in rows[:-1]]
+            avg_vol = sum(vol_window) / len(vol_window) if vol_window else 1
+            vol_ratio = last["volume"] / avg_vol if avg_vol > 0 else 1
+            
+            live = zerodha_live.get(sym, last["close"])
+            price_chg = round((live - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0
+            
+            inds = compute_indicators(rows)
+            sc, direction, fl, meta = score_candle(last, inds[-1])
+            atr_val = inds[-1].get("atr", last["close"] * 0.015)
+            if atr_val <= 0:
+                atr_val = last["close"] * 0.015
+            
+            trade_type = meta.get("recommended", "SWING")
+            lv = compute_levels(live, atr_val, direction, trade_type)
+            
+            results.append({
+                "symbol":         sym,
+                "company":        info[2],
+                "sector":         info[3],
+                "live_price":    live,
+                "prev_close":     prev_close,
+                "price_change_pct": price_chg,
+                "volume":         last["volume"],
+                "avg_volume":     round(avg_vol),
+                "vol_ratio":     round(vol_ratio, 2),
+                "direction":      direction,
+                "score":          sc,
+                "trade_type":     trade_type,
+                "atr":            lv["atr"],
+                "entry":          lv["entry"],
+                "sl":             lv["sl"],
+                "t1":             lv["t1"],
+                "risk_per":       lv["risk_per"],
+                "risk_pct":       round(lv["risk_per"] / live * 100, 2),
+                "adx":            round(meta.get("adx", 0), 1),
+                "rsi":            round(meta.get("rsi", 50), 1),
+                "is_spike":       vol_ratio >= 2.0,
+                "spike_type":     "BUYING" if price_chg > 0 and vol_ratio >= 2.0 else ("SELLING" if price_chg < 0 and vol_ratio >= 2.0 else ("HIGH VOL" if vol_ratio >= 2.0 else "NORMAL")),
+            })
+        except Exception as e:
+            continue
+    
+    results.sort(key=lambda x: (-x["vol_ratio"], -abs(x["price_change_pct"])))
+    
+    spikes = [r for r in results if r["is_spike"]]
+    all_sorted = results[:50]
+    
+    return jsonify({
+        "spikes": spikes[:30],
+        "all": all_sorted,
+        "total_scanned": len(results),
+        "spike_count": len(spikes),
+        "ts": datetime.datetime.now().isoformat(),
+    })
+
+@app.route("/api/alerts")
+def get_alerts():
+    """Get all unacknowledged momentum alerts."""
+    alerts = get_unacknowledged_alerts()
+    return jsonify({"alerts": alerts, "count": len(alerts)})
+
+@app.route("/api/alerts/acknowledge", methods=["POST"])
+def ack_alert():
+    d = request.json or {}
+    alert_id = d.get("id")
+    if alert_id:
+        acknowledge_alert(alert_id)
+    return jsonify({"ok": True})
+
+@app.route("/api/signals/log")
+def get_signal_history():
+    """Get historical signal log."""
+    limit = int(request.args.get("limit", 100))
+    signals = get_signal_log(limit)
+    return jsonify({"signals": signals})
+
+@app.route("/api/live-prices")
+def live_prices():
+    """Get all live prices from cache."""
+    prices = get_all_live_prices_db()
+    return jsonify({"prices": prices, "count": len(prices)})
+
+@app.route("/api/calc", methods=["POST"])
+def calc():
+    d     = request.json or {}
+    cap   = float(d.get("capital", 100000))
+    rp    = float(d.get("risk_pct", 1.5)) / 100
+    ep    = float(d.get("entry", 0))
+    sl    = float(d.get("sl", 0))
+    dr    = d.get("dir", "LONG")
+    sym   = d.get("symbol", "STOCK")
+    if not ep or not sl or ep == sl:
+        return jsonify({"error": "Invalid entry or SL"}), 400
+    risk  = round(cap * rp)
+    rps   = round(abs(ep - sl), 2)
+    qty   = max(1, int(risk / rps))
+    pval  = round(qty * ep)
+    brok  = 40
+    stt   = round(pval * 0.001)
+    nse   = round(pval * 0.0000345)
+    gst   = round((brok + nse) * 0.18)
+    stamp = round(pval * 0.00015)
+    tc    = brok + stt + nse + gst + stamp
+    m     = 1 if dr == "LONG" else -1
+    t1    = round(ep + m*rps*1.5, 2)
+    t2    = round(ep + m*rps*2.5, 2)
+    t3    = round(ep + m*rps*4.0, 2)
+    return jsonify({
+        "symbol": sym, "direction": dr, "capital": cap,
+        "risk_inr": risk, "risk_per": rps, "qty": qty, "pos_val": pval,
+        "charges": {"brokerage": brok, "stt": stt, "nse": nse, "gst": gst, "stamp": stamp, "total": tc},
+        "targets": {"t1": t1, "t2": t2, "t3": t3},
+        "pnl_t1":  round(risk*1.5*0.35 - tc),
+        "pnl_t2":  round(risk*1.5*0.35 + risk*2.5*0.35 - tc),
+        "pnl_t3":  round(risk*1.5*0.35 + risk*2.5*0.35 + risk*4.0*0.30 - tc),
+    })
+
+@app.route("/api/signal-log")
+def signal_log():
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM signal_log ORDER BY signal_date DESC, score DESC LIMIT 500"
+    ).fetchall()]
+    conn.close()
+    grouped = {}
+    for r in rows:
+        d = r["signal_date"]
+        if d not in grouped: grouped[d] = []
+        try: r["filters"] = json.loads(r["filters"])
+        except Exception: r["filters"] = []
+        grouped[d].append(r)
+    return jsonify({"log": grouped, "dates": sorted(grouped.keys(), reverse=True)})
+
+@app.route("/api/trades", methods=["GET", "POST"])
+def trades_route():
+    if request.method == "POST":
+        d    = request.json or {}
+        ep   = float(d.get("entry_price", 0))
+        xp   = float(d.get("exit_price",  0))
+        qty  = int(d.get("qty", 0))
+        dr   = d.get("direction", "LONG")
+        sl   = float(d.get("stop_loss", 0))
+        pval = round(qty * xp)
+        chrg = 40 + round(pval*0.001) + round(pval*0.0000345) + \
+               round((40 + round(pval*0.0000345))*0.18) + round(pval*0.00015)
+        gross = (xp - ep) * qty * (1 if dr == "LONG" else -1)
+        net   = round(gross - chrg)
+        rps   = abs(ep - sl)
+        ar    = round(net / (qty * rps), 2) if rps > 0 and qty > 0 else 0
+        hold  = 0
+        try:
+            ed   = datetime.datetime.strptime(d.get("exit_date",  ""), "%Y-%m-%d")
+            nd   = datetime.datetime.strptime(d.get("entry_date", ""), "%Y-%m-%d")
+            hold = (ed - nd).days
+        except Exception:
+            pass
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO trades(symbol,sector,direction,entry_date,exit_date,"
+            "entry_price,exit_price,stop_loss,qty,risk_inr,charges,net_pnl,actual_r,"
+            "exit_type,score,hold_days,notes,capital_before,capital_after) VALUES"
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (d.get("symbol",""), d.get("sector",""), dr, d.get("entry_date",""),
+             d.get("exit_date",""), ep, xp, sl, qty, d.get("risk_inr",0),
+             chrg, net, ar, d.get("exit_type",""), d.get("score",0),
+             hold, d.get("notes",""), d.get("capital_before",0), d.get("capital_after",0))
+        )
+        conn.commit(); conn.close()
+        return jsonify({"ok": True, "net_pnl": net, "actual_r": ar, "charges": chrg})
+
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM trades ORDER BY entry_date DESC").fetchall()]
+    conn.close()
+    W  = [t for t in rows if t["net_pnl"] > 0]
+    L  = [t for t in rows if t["net_pnl"] <= 0]
+    tw = sum(t["net_pnl"] for t in W)
+    tl = abs(sum(t["net_pnl"] for t in L)) or 1
+    return jsonify({
+        "trades": rows,
+        "stats": {
+            "total_pnl":     round(sum(t["net_pnl"] for t in rows)),
+            "win_rate":      round(len(W)/len(rows)*100, 1) if rows else 0,
+            "profit_factor": round(tw/tl, 2),
+            "total":         len(rows),
+            "wins":          len(W),
+            "losses":        len(L),
+            "total_charges": round(sum(t.get("charges",0) for t in rows)),
+        }
+    })
+
+@app.route("/api/trades/<int:tid>", methods=["DELETE"])
+def del_trade(tid):
+    conn = get_db()
+    conn.execute("DELETE FROM trades WHERE id=?", (tid,))
+    conn.commit(); conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/swing-trades")
+def swing_trades():
+    """Advanced swing trades with filtering, sorting, and accuracy metrics"""
+    trade_type = request.args.get("type", "SWING")  # SWING, INTRA, ALL
+    min_score = int(request.args.get("min_score", 0))
+    direction = request.args.get("direction", "")  # LONG, SHORT
+    limit = int(request.args.get("limit", 50))
+    sort = request.args.get("sort", "date_desc")  # date_desc, date_asc, pnl_desc, r_desc
+    
+    conn = get_db()
+    
+    # Build query
+    query = "SELECT * FROM trades WHERE 1=1"
+    params = []
+    if trade_type != "ALL":
+        query += " AND trade_type = ?"
+        params.append(trade_type)
+    if min_score > 0:
+        query += " AND score >= ?"
+        params.append(min_score)
+    if direction:
+        query += " AND direction = ?"
+        params.append(direction)
+    
+    # Sort
+    if sort == "date_desc":
+        query += " ORDER BY entry_date DESC"
+    elif sort == "date_asc":
+        query += " ORDER BY entry_date ASC"
+    elif sort == "pnl_desc":
+        query += " ORDER BY net_pnl DESC"
+    elif sort == "r_desc":
+        query += " ORDER BY actual_r DESC"
+    else:
+        query += " ORDER BY entry_date DESC"
+    
+    if limit > 0:
+        query += f" LIMIT {limit}"
+    
+    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    conn.close()
+    
+    # Calculate advanced metrics
+    W = [t for t in rows if t.get("net_pnl", 0) > 0]
+    L = [t for t in rows if t.get("net_pnl", 0) <= 0]
+    
+    # Accuracy by score
+    score_groups = {}
+    for t in rows:
+        sc = t.get("score", 0)
+        if sc not in score_groups: score_groups[sc] = {"wins": 0, "total": 0}
+        score_groups[sc]["total"] += 1
+        if t.get("net_pnl", 0) > 0: score_groups[sc]["wins"] += 1
+    
+    accuracy_by_score = {}
+    for sc, g in score_groups.items():
+        accuracy_by_score[sc] = round(g["wins"] / g["total"] * 100, 1) if g["total"] > 0 else 0
+    
+    # Monthly stats
+    monthly = {}
+    for t in rows:
+        if t.get("entry_date"):
+            month = t["entry_date"][:7]
+            if month not in monthly: monthly[month] = {"pnl": 0, "trades": 0, "wins": 0}
+            monthly[month]["trades"] += 1
+            monthly[month]["pnl"] += t.get("net_pnl", 0)
+            if t.get("net_pnl", 0) > 0: monthly[month]["wins"] += 1
+    
+    # Sector performance
+    sector_stats = {}
+    for t in rows:
+        sec = t.get("sector", "Unknown")
+        if sec not in sector_stats: sector_stats[sec] = {"pnl": 0, "trades": 0, "wins": 0}
+        sector_stats[sec]["trades"] += 1
+        sector_stats[sec]["pnl"] += t.get("net_pnl", 0)
+        if t.get("net_pnl", 0) > 0: sector_stats[sec]["wins"] += 1
+    
+    # Average R per score
+    avg_r_by_score = {}
+    for sc, g in score_groups.items():
+        rs = [t.get("actual_r", 0) for t in rows if t.get("score", 0) == sc]
+        avg_r_by_score[sc] = round(sum(rs) / len(rs), 2) if rs else 0
+    
+    tw = sum(t.get("net_pnl", 0) for t in W)
+    tl = abs(sum(t.get("net_pnl", 0) for t in L)) or 1
+    
+    return jsonify({
+        "trades": rows,
+        "count": len(rows),
+        "stats": {
+            "total_pnl": round(sum(t.get("net_pnl", 0) for t in rows)),
+            "win_rate": round(len(W) / len(rows) * 100, 1) if rows else 0,
+            "profit_factor": round(tw / tl, 2) if tl > 0 else 0,
+            "total_trades": len(rows),
+            "wins": len(W),
+            "losses": len(L),
+            "avg_win": round(sum(t.get("net_pnl", 0) for t in W) / len(W), 0) if W else 0,
+            "avg_loss": round(abs(sum(t.get("net_pnl", 0) for t in L) / len(L)), 0) if L else 0,
+        },
+        "accuracy_by_score": accuracy_by_score,
+        "avg_r_by_score": avg_r_by_score,
+        "monthly": monthly,
+        "sector_performance": sector_stats
+    })
+
+if __name__ == "__main__":
+    print("\n" + "="*55)
+    print("  Trade Smart v7 — Trading Intelligence System")
+    print("  Real-time data from ZERODHA API")
+    print("  No numpy / No pandas required!")
+    print(f"  Python {sys.version.split()[0]}")
+    cfg = gcfg()
+    has_zerodha = bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
+    if has_zerodha:
+        print("  OK Zerodha: CONNECTED -> LIVE NSE DATA")
+    else:
+        print("  WARN Zerodha: NOT CONNECTED")
+    print(f"  Data mode: {'REAL (Zerodha)' if cfg.get('use_real') else 'SYNTHETIC'}")
+    print("  http://localhost:5000")
+    print("="*55 + "\n")
+    # If Zerodha streaming is enabled, run the WS connection on the main thread
+    # (avoids Twisted signal-handler issues on Windows), while Flask runs in a worker thread.
+    use_stream = cfg.get("use_zerodha_ltp", True) and bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
+    if use_stream:
+        print("  Zerodha LTP streaming: START")
+        flask_thread = threading.Thread(
+            target=lambda: app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False),
+            daemon=True,
+        )
+        flask_thread.start()
+        _maybe_start_zerodha_ltp_stream(run_in_main_thread=True)
+    else:
+        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False)

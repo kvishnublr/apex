@@ -1,0 +1,13 @@
+# Trade Smart v7 - Requirements
+# 
+# MINIMUM (required):
+flask
+yfinance
+pytz
+kiteconnect
+#
+# Install with:
+#   python -m pip install flask yfinance pytz
+#
+# NO numpy, NO pandas, NO scipy needed!
+# Works on Python 3.9, 3.10, 3.11, 3.12, 3.13
