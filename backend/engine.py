@@ -621,6 +621,44 @@ def compute_indicators(rows):
         if c[i] > 0 and (l[i]-h[i-2])/c[i] > 0.002: fvg_b[i] = True
         if c[i] > 0 and (l[i-2]-h[i])/c[i] > 0.002: fvg_s[i] = True
 
+    # --- MARKET MICROSTRUCTURE (Volume Profile / POC) ---
+    poc = [None]*n; va_high = [None]*n; va_low = [None]*n
+    for i in range(20, n):
+        # 20-period rolling volume profile
+        win_c = c[i-20:i+1]; win_v = v[i-20:i+1]
+        if not win_c: continue
+        
+        # Simple binning for POC
+        min_p = min(win_c); max_p = max(win_c)
+        if max_p == min_p:
+            poc[i] = min_p; va_high[i] = min_p; va_low[i] = min_p
+            continue
+            
+        bins = 10; step = (max_p - min_p) / bins
+        vol_bins = [0.0] * bins
+        for price, vol in zip(win_c, win_v):
+            idx = min(int((price - min_p) / step), bins-1)
+            vol_bins[idx] += vol
+            
+        max_idx = vol_bins.index(max(vol_bins))
+        poc[i] = round(min_p + (max_idx + 0.5) * step, 2)
+        
+        # Simple 70% Value Area
+        total_v = sum(vol_bins)
+        if total_v > 0:
+            target_v = total_v * 0.7; current_v = vol_bins[max_idx]
+            l_idx = max_idx; r_idx = max_idx
+            while current_v < target_v and (l_idx > 0 or r_idx < bins - 1):
+                lv = vol_bins[l_idx-1] if l_idx > 0 else 0
+                rv = vol_bins[r_idx+1] if r_idx < bins-1 else 0
+                if lv >= rv and l_idx > 0:
+                    l_idx -= 1; current_v += lv
+                elif r_idx < bins-1:
+                    r_idx += 1; current_v += rv
+                else: break
+            va_low[i]  = round(min_p + l_idx * step, 2)
+            va_high[i] = round(min_p + (r_idx + 1) * step, 2)
+
     # Merge indicators back into rows
     ind = []
     for i in range(n):
@@ -650,6 +688,9 @@ def compute_indicators(rows):
             "fvg_b":  fvg_b[i],
             "fvg_s":  fvg_s[i],
             "rsi_prev": rsi[i-1] if i > 0 else rsi[i],
+            "poc":     poc[i],
+            "va_high": va_high[i],
+            "va_low":  va_low[i],
         })
     return ind
 
@@ -706,6 +747,13 @@ def score_candle(row, ind, rows_context=None):
     
     # === NEW: ACCURACY ENHANCEMENTS (Missing pieces) ===
     
+    # Market Regime Detection
+    # Bull: Close > e200 AND ADX >= 20
+    # Bear: Close < e200 AND ADX >= 20
+    # Sideways: ADX < 20
+    is_bull = c > e200 and adx >= 20 if e200 else True
+    is_bear = c < e200 and adx >= 20 if e200 else False
+    
     # Multi-EMA Stack check (e9 > e20 > e50 > e200) - Strongest trend
     f10b = e9 > e20 > e50 > e200 if (e200 and e50) else False
     f10s = e9 < e20 < e50 < e200 if (e200 and e50) else False
@@ -715,14 +763,25 @@ def score_candle(row, ind, rows_context=None):
     f11b = rsi > rsi_prev
     f11s = rsi < rsi_prev
     
-    # Candlestick Quality (Long: Close near high, Short: Close near low)
+    # F12: Candlestick Quality (Long: Close near high, Short: Close near low)
     candle_body = row["high"] - row["low"]
     f12b = (row["high"] - row["close"]) / candle_body < 0.2 if candle_body > 0 else False
     f12s = (row["close"] - row["low"]) / candle_body < 0.2 if candle_body > 0 else False
     
+    # F13: Volume Profile Alignment (Near POC is stable, Below POC for long is value)
+    poc_val = ind.get("poc", c)
+    va_low = ind.get("va_low", c)
+    va_high = ind.get("va_high", c)
+    f13b = c <= poc_val * 1.01 and c >= va_low # Near or below POC within value area
+    f13s = c >= poc_val * 0.99 and c <= va_high # Near or above POC within value area
+    
     # Rule-based base scores
     bs = (f1 * 2) + (f2b * 1.5) + (f3b * 2) + (f4b * 1.5) + (f5 * 1.5) + (f6b * 2) + (f7b * 1.5) + (f8b * 1) + (f9 * 1.5)
     ss = (f1 * 2) + (f2s * 1.5) + (f3s * 2) + (f4s * 1.5) + (f5 * 1.5) + (f6s * 2) + (f7s * 1.5) + (f8s * 1) + (f9 * 1.5)
+    
+    # Regime Multipliers (Trade with the trend)
+    if is_bull: bs *= 1.2; ss *= 0.8
+    if is_bear: ss *= 1.2; bs *= 0.8
     
     # Add new accuracy filters
     if f10b: bs += 1.5
@@ -731,6 +790,8 @@ def score_candle(row, ind, rows_context=None):
     if f11s: ss += 0.5
     if f12b: bs += 1.0
     if f12s: ss += 1.0
+    if f13b: bs += 0.5
+    if f13s: ss += 0.5
     
     if ema_gc: bs += 1
     if near_ema20: bs += 0.5
@@ -779,22 +840,22 @@ def score_candle(row, ind, rows_context=None):
         "trend_quality": trend_quality,
         "entry_quality": entry_quality,
         "ai_confidence": ai_confidence,
-        "ai_direction": ai_direction
+        "ai_direction": ai_direction,
+        "poc": poc_val,
+        "va_high": va_high,
+        "va_low": va_low
     }
     return sc, dr, fl, meta
 
-def compute_levels(close, atr, direction, trade_type="SWING"):
+def compute_levels(close, atr, direction, trade_type="SWING", capital=100000, risk_per_trade=0.01):
     """
-    Calculate entry/SL/targets based on trade type.
-    
-    INTRA:  Entry = live price (immediate entry), Risk = 1x ATR
-            Entry at LTP, SL = LTP - atr, T1 = LTP + atr, T2 = LTP + 2*atr
-    
-    SWING:  Entry = live price - 0.5*atr (better entry on pullback), Risk = 0.5x ATR
-            Entry slightly below LTP, SL = entry - atr*0.5, T1 = entry + atr*0.75, T2 = entry + atr*1.25
+    Calculate entry/SL/targets and position sizing based on risk management.
     """
     if atr <= 0: atr = close * 0.015
     m = 1 if direction == "LONG" else -1
+    
+    # Position Sizing: Risk Amount / (Entry - SL)
+    risk_amount = capital * risk_per_trade
     
     if trade_type == "INTRA":
         entry  = round(close, 2)
@@ -806,11 +867,14 @@ def compute_levels(close, atr, direction, trade_type="SWING"):
     else:  # SWING (default)
         # Entry slightly better than current price (pullback entry)
         entry  = round(close - m * atr * 0.5, 2)
-        rk     = round(atr * 0.5, 2)  # 0.5x ATR risk for swing
+        rk     = round(atr * 1.5, 2)  # 1.5x ATR risk for swing
         sl     = round(entry - m * rk, 2)
-        t1     = round(entry + m * rk * 1.5, 2)
-        t2     = round(entry + m * rk * 2.5, 2)
-        t3     = round(entry + m * rk * 4.0, 2)
+        t1     = round(entry + m * rk * 2.5, 2)
+        t2     = round(entry + m * rk * 4.5, 2)
+        t3     = round(entry + m * rk * 7.0, 2)
+        
+    risk_per_share = abs(entry - sl)
+    qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
     
     return {
         "entry":    entry,
@@ -818,8 +882,11 @@ def compute_levels(close, atr, direction, trade_type="SWING"):
         "t1":       t1,
         "t2":       t2,
         "t3":       t3,
-        "risk_per": rk,
+        "risk_per": round(risk_per_share, 2),
         "atr":      round(atr, 2),
+        "qty":      qty,
+        "risk_amount": round(risk_amount, 2),
+        "total_value": round(qty * entry, 2)
     }
 
 # ── ENHANCED BACKTEST FOR SWING (>80% ACCURACY) ─────────────────────
