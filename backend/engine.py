@@ -649,11 +649,16 @@ def compute_indicators(rows):
             "sw_s":   sw_s[i],
             "fvg_b":  fvg_b[i],
             "fvg_s":  fvg_s[i],
+            "rsi_prev": rsi[i-1] if i > 0 else rsi[i],
         })
     return ind
 
 # ── ENHANCED SCORING FOR SWING (>80% ACCURACY) ────────────────────────
-def score_candle(row, ind):
+def score_candle(row, ind, rows_context=None):
+    """
+    Enhanced scoring combining rule-based technicals with ML ensemble.
+    Returns: score (0-9), direction, filters, meta
+    """
     c   = row["close"]
     adx = ind["adx"]  or 0
     ark = ind["atr_rk"] or 50
@@ -675,16 +680,14 @@ def score_candle(row, ind):
     f2b = ind["bos_b"]; f2s = ind["bos_s"]
     
     # F3: EMA Stack Alignment (critical for swing - price > e50 > e20, weight: 2x)
-    # For LONG: price above all EMAs, e50 above e20, e20 above e200 (if exists)
     e50_above_e20 = e50 > e20 if e20 else False
     e20_above_e200 = e20 > e200 if e200 else True
     f3b = c > e50 and e50_above_e20 and (not e200 or e20_above_e200 or c > e200)
-    # For SHORT: price below all EMAs
     f3s = c < e50 and e50 < e20 and (not e200 or e20 < e200 or c < e200)
     
     # F4: RSI Momentum (optimal swing range: 40-60, not overbought, weight: 1.5x)
-    f4b = 42 <= rsi <= 62  # Swing longs work best in neutral RSI
-    f4s = 38 <= rsi <= 58  # Swing shorts work in slightly oversold
+    f4b = 42 <= rsi <= 62
+    f4s = 38 <= rsi <= 58
     
     # F5: Order Block / FVG (high probability reversal zones, weight: 1.5x)
     f5  = ind["at_ob"] or ind["fvg_b"] or ind["fvg_s"]
@@ -699,26 +702,58 @@ def score_candle(row, ind):
     f8b = mh > 0; f8s = mh < 0
     
     # F9: Volume Confirmation (volume should support trend, weight: 1.5x)
-    f9  = vr >= 1.3  # Increased threshold for swing
+    f9  = vr >= 1.3
     
-    # === BONUS FILTERS (Extra confidence) ===
+    # === NEW: ACCURACY ENHANCEMENTS (Missing pieces) ===
     
-    # B1: EMA Golden Cross (e9 above e20 for longs) - bonus for swing
-    ema_gc = (e9 > e20) if e20 else False
-    # B2: Price near 20EMA support (within 2%) - strong swing entry
-    near_ema20 = abs(c - e20) / e20 < 0.02 if e20 else False
+    # Multi-EMA Stack check (e9 > e20 > e50 > e200) - Strongest trend
+    f10b = e9 > e20 > e50 > e200 if (e200 and e50) else False
+    f10s = e9 < e20 < e50 < e200 if (e200 and e50) else False
     
-    # Calculate weighted scores (swing accuracy focus)
-    # Long score: ADX (2x) + BOS (1.5x) + EMA (2x) + RSI (1.5x) + OB/FVG (1.5x) + Liquidity (2x) + ST (1.5x) + MACD (1x) + Vol (1.5x)
+    # RSI Direction check (RSI rising for long, falling for short)
+    rsi_prev = ind.get("rsi_prev", rsi)
+    f11b = rsi > rsi_prev
+    f11s = rsi < rsi_prev
+    
+    # Candlestick Quality (Long: Close near high, Short: Close near low)
+    candle_body = row["high"] - row["low"]
+    f12b = (row["high"] - row["close"]) / candle_body < 0.2 if candle_body > 0 else False
+    f12s = (row["close"] - row["low"]) / candle_body < 0.2 if candle_body > 0 else False
+    
+    # Rule-based base scores
     bs = (f1 * 2) + (f2b * 1.5) + (f3b * 2) + (f4b * 1.5) + (f5 * 1.5) + (f6b * 2) + (f7b * 1.5) + (f8b * 1) + (f9 * 1.5)
     ss = (f1 * 2) + (f2s * 1.5) + (f3s * 2) + (f4s * 1.5) + (f5 * 1.5) + (f6s * 2) + (f7s * 1.5) + (f8s * 1) + (f9 * 1.5)
     
-    # Bonus for EMA golden cross
-    if ema_gc: bs += 1
+    # Add new accuracy filters
+    if f10b: bs += 1.5
+    if f10s: ss += 1.5
+    if f11b: bs += 0.5
+    if f11s: ss += 0.5
+    if f12b: bs += 1.0
+    if f12s: ss += 1.0
     
-    # Bonus for price near 20EMA
+    if ema_gc: bs += 1
     if near_ema20: bs += 0.5
     
+    # === AI ENSEMBLE INTEGRATION (The "AI that actually helps") ===
+    ai_confidence = 50
+    ai_direction = "NEUTRAL"
+    
+    if rows_context and _SKLEARN_AVAILABLE and _ml_trained:
+        try:
+            ml_res = predict_momentum_ml(rows_context)
+            if ml_res:
+                ai_confidence = int(ml_res['avg_prob'] * 100)
+                ai_direction = ml_res['direction']
+                
+                # Boost score if AI agrees with rule-based direction
+                if ai_direction == "LONG" and bs > ss:
+                    bs += (ml_res['avg_prob'] - 0.5) * 4  # Boost up to 2 points
+                elif ai_direction == "SHORT" and ss > bs:
+                    ss += (0.5 - ml_res['avg_prob']) * 4
+        except Exception:
+            pass
+            
     dr = "LONG" if bs >= ss else "SHORT"
     sc = round(bs if dr == "LONG" else ss, 1)
     
@@ -734,7 +769,6 @@ def score_candle(row, ind):
           f8b if dr=="LONG" else f8s,
           f9]
     
-    # Enhanced meta for swing
     trend_quality = "STRONG" if adx >= 30 else "MODERATE" if adx >= 22 else "WEAK"
     entry_quality = "IDEAL" if (ema_gc and near_ema20) else "GOOD" if ema_gc or near_ema20 else "NORMAL"
     
@@ -744,6 +778,8 @@ def score_candle(row, ind):
         "st": "BULL" if f7b else "BEAR",
         "trend_quality": trend_quality,
         "entry_quality": entry_quality,
+        "ai_confidence": ai_confidence,
+        "ai_direction": ai_direction
     }
     return sc, dr, fl, meta
 
@@ -822,7 +858,7 @@ def run_backtest(all_stocks_data, params):
     for info, rows, inds in all_stocks_data:
         sym = info[0]
         for i in range(WARMUP, len(rows)):
-            sc, dr, fl, meta = score_candle(rows[i], inds[i])
+            sc, dr, fl, meta = score_candle(rows[i], inds[i], rows[:i+1])
             if sc >= min_score:
                 # Determine recommended type based on indicators
                 adx = inds[i].get("adx", 0)
@@ -1028,16 +1064,17 @@ def _extract_features(df):
     if df is None:
         return None
     try:
-        close = np.array(df['close'])
-        high = np.array(df['high'])
-        low = np.array(df['low'])
-        volume = np.array(df['volume'])
+        close = np.array(df['close'], dtype=float)
+        high = np.array(df['high'], dtype=float)
+        low = np.array(df['low'], dtype=float)
+        volume = np.array(df['volume'], dtype=float)
         
         if len(close) < 30:
             return None
         
         features = []
         
+        # Returns
         ret_1 = np.diff(close) / close[:-1]
         ret_3 = (close[-1] - close[-4]) / close[-4] if len(close) >= 4 else 0
         ret_5 = (close[-1] - close[-6]) / close[-6] if len(close) >= 6 else 0
@@ -1048,22 +1085,27 @@ def _extract_features(df):
         features.append(ret_5)
         features.append(ret_10)
         
+        # Volatility
         features.append(np.std(ret_1[-5:]) if len(ret_1) >= 5 else 0)
         features.append(np.std(ret_1[-10:]) if len(ret_1) >= 10 else 0)
         
+        # Volume
         vol_ma5 = np.mean(volume[-6:]) if len(volume) >= 6 else volume[-1]
         vol_ma20 = np.mean(volume[-21:]) if len(volume) >= 21 else volume[-1]
         features.append(volume[-1] / vol_ma5 if vol_ma5 > 0 else 1)
         features.append(vol_ma5 / vol_ma20 if vol_ma20 > 0 else 1)
         
+        # Range
         highs_10 = high[-11:]
         lows_10 = low[-11:]
         features.append((highs_10[-1] - lows_10[0]) / lows_10[0] if lows_10[0] > 0 else 0)
         
+        # Position in range
         high20 = np.max(high[-21:]) if len(high) >= 21 else high[-1]
         low20 = np.min(low[-21:]) if len(low) >= 21 else low[-1]
         features.append((close[-1] - low20) / (high20 - low20) if high20 > low20 else 0.5)
         
+        # Trend
         sma5 = np.mean(close[-6:]) if len(close) >= 6 else close[-1]
         sma10 = np.mean(close[-11:]) if len(close) >= 11 else close[-1]
         sma20 = np.mean(close[-21:]) if len(close) >= 21 else close[-1]
@@ -1072,14 +1114,26 @@ def _extract_features(df):
         features.append(close[-1] / sma20 - 1 if sma20 > 0 else 0)
         features.append(1 if sma5 > sma10 else -1)
         
+        # ATR-like
         tr = np.maximum(high[1:] - low[1:], np.maximum(
             np.abs(high[1:] - close[:-1]),
             np.abs(low[1:] - close[:-1])
         ))
         features.append(np.mean(tr[-14:]) / close[-1] if len(tr) >= 14 and close[-1] > 0 else 0)
         
+        # RSI (Simple calculation for features)
+        diff = np.diff(close)
+        gain = np.where(diff > 0, diff, 0)
+        loss = np.where(diff < 0, -diff, 0)
+        avg_gain = np.mean(gain[-14:]) if len(gain) >= 14 else 1e-9
+        avg_loss = np.mean(loss[-14:]) if len(loss) >= 14 else 1e-9
+        rs = avg_gain / avg_loss if avg_loss > 0 else 100
+        rsi_val = 100 - (100 / (1 + rs))
+        features.append(rsi_val / 100.0)
+        
         return features
-    except Exception:
+    except Exception as e:
+        print(f"[ML] Feature extraction error: {e}")
         return None
 
 def _create_training_labels(df, horizon=5, threshold=0.02):

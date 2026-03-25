@@ -93,6 +93,31 @@ def init_db():
         acknowledged INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS sector_analysis (
+        symbol TEXT PRIMARY KEY,
+        sector TEXT, company TEXT, direction TEXT,
+        score REAL, live_price REAL, entry_price REAL,
+        sl REAL, t1 REAL, t2 REAL,
+        adx REAL, rsi REAL, vol_ratio REAL,
+        risk_pct REAL, trade_type TEXT,
+        ai_prediction REAL, ai_confidence INTEGER,
+        momentum_score INTEGER, updated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS ai_predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT, sector TEXT, direction TEXT,
+        current_price REAL, predicted_target REAL,
+        confidence INTEGER, ai_score INTEGER,
+        reasoning TEXT, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS backtest_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        params TEXT,
+        summary TEXT,
+        trades TEXT,
+        equity TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_signal_date ON signal_log(signal_date);
     CREATE INDEX IF NOT EXISTS idx_signal_symbol ON signal_log(symbol);
     CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_cache(symbol);
@@ -195,20 +220,25 @@ def acknowledge_alert(alert_id):
     conn.commit(); conn.close()
 
 def log_signal(signal_data):
-    """Store a signal in the log."""
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO signal_log (signal_date, symbol, sector, direction, score, trade_type,
-            entry, sl, t1, t2, t3, adx, rsi, vol_ratio, filters, entry_time, atr, live_price, risk_pct)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (signal_data["date"], signal_data["symbol"], signal_data["sector"],
-          signal_data["direction"], signal_data["score"], signal_data.get("trade_type", "SWING"),
-          signal_data["entry"], signal_data["sl"], signal_data["t1"], signal_data["t2"], signal_data["t3"],
-          signal_data["adx"], signal_data["rsi"], signal_data["vol_ratio"],
-          json.dumps(signal_data["filters"]), signal_data.get("entry_time", "09:20"),
-          signal_data.get("atr", 0), signal_data.get("live_price", 0),
-          signal_data.get("risk_pct", 0)))
-    conn.commit(); conn.close()
+    """Store a signal in the log with detailed entry info."""
+    try:
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO signal_log (signal_date, symbol, sector, direction, score, trade_type,
+                entry, sl, t1, t2, t3, adx, rsi, vol_ratio, filters, entry_time, atr, live_price, risk_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (signal_data["date"], signal_data["symbol"], signal_data["sector"],
+              signal_data["direction"], signal_data["score"], signal_data.get("trade_type", "SWING"),
+              signal_data["entry"], signal_data["sl"], signal_data["t1"], signal_data["t2"], signal_data["t3"],
+              signal_data["adx"], signal_data["rsi"], signal_data["vol_ratio"],
+              json.dumps(signal_data["filters"]), signal_data.get("entry_time", "09:20"),
+              signal_data.get("atr", 0), signal_data.get("live_price", 0),
+              signal_data.get("risk_pct", 0)))
+        conn.commit()
+        conn.close()
+        print(f"[DB] Logged {signal_data.get('trade_type')} signal: {signal_data['symbol']}")
+    except Exception as e:
+        print(f"[DB ERROR] log_signal: {e}")
 
 def get_signal_log(limit=100):
     conn = get_db()
@@ -377,17 +407,10 @@ def _full_universe_scan():
             avg_vol = sum(vol_window) / len(vol_window) if vol_window else 1
             update_live_price(sym, lp, last["close"], last["volume"], avg_vol)
             
-            # Score and log signal
-            sc, direction, fl, meta = score_candle(last, ind)
-            if sc >= 5:
-                trade_type = meta.get("trend_quality", "SWING")
-                if meta.get("adx", 0) >= 22 and 35 <= meta.get("rsi", 50) <= 70:
-                    trade_type = "SWING"
-                elif meta.get("adx", 0) < 18 or meta.get("rsi", 0) > 75 or meta.get("rsi", 0) < 25:
-                    trade_type = "INTRA"
-                else:
-                    trade_type = "SWING"
-                
+            # Score and log signal (Accuracy focus: Score >= 7)
+            sc, direction, fl, meta = score_candle(last, ind, rows)
+            if sc >= 7:
+                trade_type = "SWING" if meta.get("adx", 0) >= 22 else "INTRA"
                 lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
                 risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
                 
@@ -406,6 +429,7 @@ def _full_universe_scan():
                     "risk_pct": risk_pct,
                 }
                 log_signal(signal_data)
+                print(f"[SIGNAL] HIGH ACCURACY: {sym} ({direction}) Score: {sc}")
                 
         except Exception as e:
             continue
@@ -430,17 +454,19 @@ def _full_universe_scan():
             last = rows[-1]
             ind = compute_indicators(rows)[-1]
             
-            sc, direction, fl, meta = score_candle(last, ind)
+            sc, direction, fl, meta = score_candle(last, ind, rows)
             trade_type = meta.get("trend_quality", "SWING")
             lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
             risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
             
+            # Store analysis for sector views
             _store_sector_analysis(info, sym, direction, sc, lv, lp, risk_pct, trade_type, meta, ind)
         except:
             continue
     
-    if scanned_count > 0 and not _ml_trained:
-        print(f"[ML] Training models on {scanned_count} symbols...")
+    # Re-train models with the freshly scanned data
+    if scanned_count > 0:
+        print(f"[ML] Training models on {scanned_count} symbols with latest market data...")
         _train_models(_ml_data_cache)
 
 def _check_momentum_alerts():
@@ -484,7 +510,7 @@ def _check_momentum_alerts():
                     last = rows[-1]
                     ind = inds[-1]
                     
-                    sc, direction, fl, meta = score_candle(last, ind)
+                    sc, direction, fl, meta = score_candle(last, ind, rows)
                     adx = meta.get("adx", 0)
                     rsi_val = meta.get("rsi", 50)
                     vr = meta.get("vr", 1)
@@ -922,6 +948,26 @@ def make_signal(sym, info, rows, inds, idx, sc, dr, fl, meta, entry_time=None):
     }
 
 # ── CORS ─────────────────────────────────
+@app.route("/api/signals/intra")
+def get_intra_signals():
+    """Get high-accuracy intraday signals from DB."""
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM signal_log WHERE trade_type = 'INTRA' AND score >= 7 ORDER BY logged_at DESC LIMIT 50"
+    ).fetchall()]
+    conn.close()
+    return jsonify({"signals": rows})
+
+@app.route("/api/signals/swing")
+def get_swing_signals():
+    """Get high-accuracy swing signals from DB."""
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM signal_log WHERE trade_type = 'SWING' AND score >= 7 ORDER BY logged_at DESC LIMIT 50"
+    ).fetchall()]
+    conn.close()
+    return jsonify({"signals": rows})
+
 @app.after_request
 def cors(r):
     r.headers["Access-Control-Allow-Origin"]  = "*"
@@ -1244,6 +1290,12 @@ def scanner_cached():
 
 @app.route("/api/scanner")
 def scanner():
+    """Default to cached scanner results for immediate loading."""
+    refresh = request.args.get("refresh", "0") == "1"
+    if not refresh:
+        return scanner_cached()
+    
+    # Original scanner logic for force refresh
     ms  = int(request.args.get("min_score", 0))
     sec = request.args.get("sector", "")
     dr  = request.args.get("dir", "")
@@ -1458,37 +1510,84 @@ def history(sym):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/backtest", methods=["POST"])
+@app.route("/api/backtest", methods=["GET", "POST"])
 def backtest_route():
+    if request.method == "GET":
+        # Return cached backtest results
+        conn = get_db()
+        row = conn.execute("SELECT * FROM backtest_results ORDER BY created_at DESC LIMIT 1").fetchone()
+        conn.close()
+        if row:
+            return jsonify({
+                "summary": json.loads(row["summary"]),
+                "trades": json.loads(row["trades"]),
+                "equity": json.loads(row["equity"]),
+                "params": json.loads(row["params"]),
+                "created_at": row["created_at"],
+                "cached": True
+            })
+        return jsonify({"error": "No backtest data found"}), 404
+
     params  = request.json or {}
     cfg     = gcfg()
     months  = int(params.get("months", 6))
     syms    = params.get("symbols", [u[0] for u in UNIVERSE])
-    trade_type = params.get("trade_type", "ALL")  # SWING, INTRA, or ALL
+    trade_type = params.get("trade_type", "ALL")
     use_real = cfg.get("use_real", False)
+    
     print(f"[BT] Loading {len(syms)} stocks (use_real={use_real}, type={trade_type})...")
     stock_data = []
     for info in UNIVERSE:
         if info[0] not in syms: continue
         try:
-            rows = get_ohlcv(info, months=months + 3, use_real=use_real)
-            if not rows or len(rows) < 30:
-                continue
-            inds = compute_indicators(rows)
+            rows, inds = get_stock(info[0], use_real=use_real)
+            if not rows or len(rows) < 30: continue
             stock_data.append((info, rows, inds))
         except Exception as e:
             print(f"  skip {info[0]}: {e}")
+            
     print(f"[BT] Running on {len(stock_data)} stocks...")
     result = run_backtest(stock_data, params)
+    
+    # Store in DB for retrieval
+    try:
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO backtest_results (params, summary, trades, equity)
+            VALUES (?, ?, ?, ?)
+        """, (json.dumps(params), json.dumps(result["summary"]), 
+              json.dumps(result["trades"]), json.dumps(result["equity"])))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[BT ERROR] Failed to cache: {e}")
+        
     return jsonify(result)
 
 @app.route("/api/oi-spikes")
 def oi_spikes():
-    """
-    Detect unusual volume/activity spikes across the universe.
-    Uses volume ratio vs 20-day average as a proxy for OI concentration.
-    Returns top stocks with unusual activity, sorted by spike intensity.
-    """
+    """Default to cached results for performance."""
+    refresh = request.args.get("refresh", "0") == "1"
+    if not refresh:
+        # Sort cached analysis by vol_ratio
+        conn = get_db()
+        cur = conn.execute("""
+            SELECT symbol, company, sector, live_price, vol_ratio, score, direction, trade_type, adx, rsi, momentum_score
+            FROM sector_analysis 
+            WHERE vol_ratio >= 1.5
+            ORDER BY vol_ratio DESC LIMIT 50
+        """)
+        out = []
+        for r in cur.fetchall():
+            out.append({
+                "symbol": r[0], "company": r[1], "sector": r[2], "live_price": r[3],
+                "vol_ratio": r[4], "score": r[5], "direction": r[6], "trade_type": r[7],
+                "adx": r[8], "rsi": r[9], "momentum_score": r[10], "is_spike": r[4] >= 2.0
+            })
+        conn.close()
+        return jsonify({"spikes": [x for x in out if x["is_spike"]], "all": out, "cached": True})
+
+    # Original heavy logic only if refresh requested
     cfg = gcfg()
     use_real = cfg.get("use_real", True)
     zerodha_live = {}
