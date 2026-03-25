@@ -1050,6 +1050,48 @@ def get_swing_signals():
     conn.close()
     return jsonify({"signals": signals, "current": current})
 
+@app.route("/api/stock-detail/<symbol>")
+def stock_detail(symbol):
+    """Get comprehensive details for a specific stock."""
+    conn = get_db()
+    
+    # 1. Current analysis from sector_analysis
+    analysis = conn.execute("""
+        SELECT * FROM sector_analysis WHERE symbol = ?
+    """, (symbol,)).fetchone()
+    
+    if not analysis:
+        conn.close()
+        return jsonify({"error": "Stock analysis not found"}), 404
+        
+    analysis_dict = dict(analysis)
+    
+    # 2. Signal history from signal_log
+    history = [dict(r) for r in conn.execute("""
+        SELECT * FROM signal_log WHERE symbol = ? ORDER BY logged_at DESC LIMIT 10
+    """, (symbol,)).fetchall()]
+    
+    # 3. Recent price history from price_cache (last 30 days)
+    prices = [dict(r) for r in conn.execute("""
+        SELECT * FROM price_cache WHERE symbol = ? ORDER BY date DESC LIMIT 30
+    """, (symbol,)).fetchall()]
+    
+    # 4. Get latest AI predictions
+    prediction = conn.execute("""
+        SELECT * FROM ai_predictions WHERE symbol = ? ORDER BY created_at DESC LIMIT 1
+    """, (symbol,)).fetchone()
+    prediction_dict = dict(prediction) if prediction else None
+    
+    conn.close()
+    
+    return jsonify({
+        "symbol": symbol,
+        "analysis": analysis_dict,
+        "history": history,
+        "prices": prices,
+        "prediction": prediction_dict
+    })
+
 @app.after_request
 def cors(r):
     r.headers["Access-Control-Allow-Origin"]  = "*"
