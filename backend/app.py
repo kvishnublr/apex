@@ -69,6 +69,9 @@ def init_db():
         sl REAL, t1 REAL, t2 REAL, t3 REAL,
         adx REAL, rsi REAL, vol_ratio REAL,
         risk_pct REAL, risk_per REAL, atr REAL, trade_type TEXT,
+        e20 REAL DEFAULT 0, e50 REAL DEFAULT 0, e200 REAL DEFAULT 0,
+        supertrend REAL DEFAULT 0, st_dir INTEGER DEFAULT 0,
+        vwap REAL DEFAULT 0, poc REAL DEFAULT 0, va_low REAL DEFAULT 0, va_high REAL DEFAULT 0,
         ai_prediction REAL, ai_confidence INTEGER,
         momentum_score INTEGER, updated_at TEXT
     );
@@ -76,7 +79,44 @@ def init_db():
     
     # Check for missing columns in sector_analysis (for migrations)
     cursor = conn.execute("PRAGMA table_info(sector_analysis)")
-    columns = [row[1] for row in cursor.fetchall()]
+    sector_info_rows = cursor.fetchall()
+    columns = [row[1] for row in sector_info_rows]
+    symbol_pk = any(r[1] == "symbol" and r[5] == 1 for r in sector_info_rows)
+    if not symbol_pk:
+        print("[DB] Migrating sector_analysis to v2 schema (dedupe by symbol)")
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sector_analysis_v2 (
+            symbol TEXT PRIMARY KEY,
+            sector TEXT, company TEXT, direction TEXT,
+            score REAL, live_price REAL, entry_price REAL,
+            sl REAL, t1 REAL, t2 REAL, t3 REAL,
+            adx REAL, rsi REAL, vol_ratio REAL,
+            risk_pct REAL, risk_per REAL, atr REAL, trade_type TEXT,
+            e20 REAL DEFAULT 0, e50 REAL DEFAULT 0, e200 REAL DEFAULT 0,
+            supertrend REAL DEFAULT 0, st_dir INTEGER DEFAULT 0,
+            vwap REAL DEFAULT 0, poc REAL DEFAULT 0, va_low REAL DEFAULT 0, va_high REAL DEFAULT 0,
+            ai_prediction REAL, ai_confidence INTEGER,
+            momentum_score INTEGER, updated_at TEXT
+        );
+        """)
+        conn.execute("""
+            INSERT OR REPLACE INTO sector_analysis_v2
+            (symbol, sector, company, direction, score, live_price, entry_price, sl, t1, t2, t3,
+             adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
+             e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
+             ai_prediction, ai_confidence, momentum_score, updated_at)
+            SELECT symbol, sector, company, direction, score, live_price, entry_price, sl, t1, t2, t3,
+                   adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
+                   e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
+                   ai_prediction, ai_confidence, momentum_score, updated_at
+            FROM sector_analysis
+            WHERE id IN (SELECT MAX(id) FROM sector_analysis GROUP BY symbol)
+        """)
+        conn.execute("DROP TABLE sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis_v2 RENAME TO sector_analysis")
+        cursor = conn.execute("PRAGMA table_info(sector_analysis)")
+        sector_info_rows = cursor.fetchall()
+        columns = [row[1] for row in sector_info_rows]
     
     if "t3" not in columns:
         print("[DB] Adding missing column 't3' to sector_analysis")
@@ -87,6 +127,33 @@ def init_db():
     if "atr" not in columns:
         print("[DB] Adding missing column 'atr' to sector_analysis")
         conn.execute("ALTER TABLE sector_analysis ADD COLUMN atr REAL DEFAULT 0")
+    if "e20" not in columns:
+        print("[DB] Adding missing column 'e20' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN e20 REAL DEFAULT 0")
+    if "e50" not in columns:
+        print("[DB] Adding missing column 'e50' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN e50 REAL DEFAULT 0")
+    if "e200" not in columns:
+        print("[DB] Adding missing column 'e200' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN e200 REAL DEFAULT 0")
+    if "supertrend" not in columns:
+        print("[DB] Adding missing column 'supertrend' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN supertrend REAL DEFAULT 0")
+    if "st_dir" not in columns:
+        print("[DB] Adding missing column 'st_dir' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN st_dir INTEGER DEFAULT 0")
+    if "vwap" not in columns:
+        print("[DB] Adding missing column 'vwap' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN vwap REAL DEFAULT 0")
+    if "poc" not in columns:
+        print("[DB] Adding missing column 'poc' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN poc REAL DEFAULT 0")
+    if "va_low" not in columns:
+        print("[DB] Adding missing column 'va_low' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN va_low REAL DEFAULT 0")
+    if "va_high" not in columns:
+        print("[DB] Adding missing column 'va_high' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN va_high REAL DEFAULT 0")
         
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS price_cache (
@@ -96,7 +163,9 @@ def init_db():
         close_price REAL, volume INTEGER,
         atr REAL DEFAULT 0, adx REAL DEFAULT 0, rsi REAL DEFAULT 0,
         e20 REAL DEFAULT 0, e50 REAL DEFAULT 0, e200 REAL DEFAULT 0,
-        supertrend REAL DEFAULT 0,
+        supertrend REAL DEFAULT 0, st_dir INTEGER DEFAULT 0,
+        vwap REAL DEFAULT 0, poc REAL DEFAULT 0, va_low REAL DEFAULT 0, va_high REAL DEFAULT 0,
+        vr REAL DEFAULT 0, atr_rk REAL DEFAULT 0,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(symbol, date)
     );
@@ -142,6 +211,41 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_cache(symbol);
     CREATE INDEX IF NOT EXISTS idx_alert_ack ON momentum_alerts(acknowledged);
     """)
+
+    try:
+        conn.execute("""
+            DELETE FROM signal_log
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM signal_log GROUP BY signal_date, symbol, trade_type
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_signal_day ON signal_log(signal_date, symbol, trade_type)")
+    except Exception as e:
+        print(f"[DB] Signal log dedupe/index warning: {e}")
+    
+    cursor = conn.execute("PRAGMA table_info(price_cache)")
+    price_cols = [row[1] for row in cursor.fetchall()]
+    if "st_dir" not in price_cols:
+        print("[DB] Adding missing column 'st_dir' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN st_dir INTEGER DEFAULT 0")
+    if "vwap" not in price_cols:
+        print("[DB] Adding missing column 'vwap' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN vwap REAL DEFAULT 0")
+    if "poc" not in price_cols:
+        print("[DB] Adding missing column 'poc' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN poc REAL DEFAULT 0")
+    if "va_low" not in price_cols:
+        print("[DB] Adding missing column 'va_low' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN va_low REAL DEFAULT 0")
+    if "va_high" not in price_cols:
+        print("[DB] Adding missing column 'va_high' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN va_high REAL DEFAULT 0")
+    if "vr" not in price_cols:
+        print("[DB] Adding missing column 'vr' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN vr REAL DEFAULT 0")
+    if "atr_rk" not in price_cols:
+        print("[DB] Adding missing column 'atr_rk' to price_cache")
+        conn.execute("ALTER TABLE price_cache ADD COLUMN atr_rk REAL DEFAULT 0")
     conn.commit(); conn.close()
 
 init_db()
@@ -152,20 +256,26 @@ def upsert_price(symbol, date, open_p, high_p, low_p, close_p, volume, indicator
     """Store/update price with indicators in cache."""
     conn = get_db()
     conn.execute("""
-        INSERT INTO price_cache (symbol, date, open_price, high_price, low_price, close_price, volume, atr, adx, rsi, e20, e50, e200, supertrend, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO price_cache (symbol, date, open_price, high_price, low_price, close_price, volume, atr, adx, rsi, e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high, vr, atr_rk, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(symbol, date) DO UPDATE SET
             open_price=excluded.open_price, high_price=excluded.high_price,
             low_price=excluded.low_price, close_price=excluded.close_price,
             volume=excluded.volume, atr=excluded.atr, adx=excluded.adx,
             rsi=excluded.rsi, e20=excluded.e20, e50=excluded.e50,
             e200=excluded.e200, supertrend=excluded.supertrend,
+            st_dir=excluded.st_dir, vwap=excluded.vwap, poc=excluded.poc,
+            va_low=excluded.va_low, va_high=excluded.va_high, vr=excluded.vr,
+            atr_rk=excluded.atr_rk,
             updated_at=CURRENT_TIMESTAMP
     """, (symbol, date, open_p, high_p, low_p, close_p, volume,
           indicators.get("atr", 0), indicators.get("adx", 0),
           indicators.get("rsi", 0), indicators.get("e20", 0),
           indicators.get("e50", 0), indicators.get("e200", 0),
-          indicators.get("st", 0)))
+          indicators.get("st", 0), indicators.get("st_dir", 0),
+          indicators.get("vwap", 0), indicators.get("poc", 0),
+          indicators.get("va_low", 0), indicators.get("va_high", 0),
+          indicators.get("vr", 0), indicators.get("atr_rk", 0)))
     conn.commit(); conn.close()
 
 def update_live_price(symbol, price, prev_close, volume, avg_vol):
@@ -246,6 +356,24 @@ def log_signal(signal_data):
             INSERT INTO signal_log (signal_date, symbol, sector, direction, score, trade_type,
                 entry, sl, t1, t2, t3, adx, rsi, vol_ratio, filters, entry_time, atr, live_price, risk_pct)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_date, symbol, trade_type) DO UPDATE SET
+                sector=excluded.sector,
+                direction=excluded.direction,
+                score=excluded.score,
+                entry=excluded.entry,
+                sl=excluded.sl,
+                t1=excluded.t1,
+                t2=excluded.t2,
+                t3=excluded.t3,
+                adx=excluded.adx,
+                rsi=excluded.rsi,
+                vol_ratio=excluded.vol_ratio,
+                filters=excluded.filters,
+                entry_time=excluded.entry_time,
+                atr=excluded.atr,
+                live_price=excluded.live_price,
+                risk_pct=excluded.risk_pct,
+                logged_at=CURRENT_TIMESTAMP
         """, (signal_data["date"], signal_data["symbol"], signal_data["sector"],
               signal_data["direction"], signal_data["score"], signal_data.get("trade_type", "SWING"),
               signal_data["entry"], signal_data["sl"], signal_data["t1"], signal_data["t2"], signal_data["t3"],
@@ -295,11 +423,20 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
         conn.execute("""
             INSERT OR REPLACE INTO sector_analysis 
             (sector, symbol, company, direction, score, live_price, entry_price, sl, t1, t2, t3,
-             adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, ai_prediction, ai_confidence, momentum_score, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (info[3], sym, info[1], direction, score, live_price, levels["entry"],
-              levels["sl"], levels["t1"], levels["t2"], levels.get("t3", 0), adx, rsi, vr, risk_pct, 
-              levels.get("risk_per", 0), atr, trade_type, levels.get("t2", 0), confidence, momentum, now))
+             adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
+             e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
+             ai_prediction, ai_confidence, momentum_score, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            info[3], sym, info[1], direction, score, live_price, levels["entry"],
+            levels["sl"], levels["t1"], levels["t2"], levels.get("t3", 0),
+            adx, rsi, vr, risk_pct, levels.get("risk_per", 0), atr, trade_type,
+            ind.get("e20") or 0, ind.get("e50") or 0, ind.get("e200") or 0,
+            ind.get("st") or 0, ind.get("st_dir") or 0,
+            ind.get("vwap") or 0, ind.get("poc") or 0,
+            ind.get("va_low") or 0, ind.get("va_high") or 0,
+            levels.get("t2", 0), confidence, momentum, now
+        ))
         
         conn.commit()
         conn.close()
@@ -639,10 +776,16 @@ def gcfg():
     try:
         if os.path.exists(CFG):
             with open(CFG) as f:
-                return {**DEFAULTS, **json.load(f)}
+                cfg = {**DEFAULTS, **json.load(f)}
+                cfg["use_real"] = True
+                cfg["use_zerodha_ltp"] = True
+                return cfg
     except Exception:
         pass
-    return DEFAULTS.copy()
+    cfg = DEFAULTS.copy()
+    cfg["use_real"] = True
+    cfg["use_zerodha_ltp"] = True
+    return cfg
 
 def scfg(d):
     os.makedirs(os.path.dirname(CFG), exist_ok=True)
@@ -855,7 +998,7 @@ def _fresh_ltps(now_ts, max_age_sec=2.5):
 def get_stock(sym, use_real=None, force_refresh=False):
     cfg = gcfg()
     if use_real is None:
-        use_real = cfg.get("use_real", True)
+        use_real = True
     
     # Cache for 5 minutes if using real data, always refresh if force_refresh
     import time
@@ -872,11 +1015,11 @@ def get_stock(sym, use_real=None, force_refresh=False):
         print(f"[WARN] Symbol not found: {sym}")
         return None, None
     
-    print(f"[DATA] Fetching {'REAL' if use_real else 'SYNTHETIC'} data for {sym}...")
-    rows = get_ohlcv(info, months=9, use_real=use_real)
+    print(f"[DATA] Fetching REAL data for {sym}...")
+    rows = get_ohlcv(info, months=9, use_real=True)
     if not rows or len(rows) < 30:
-        print(f"[WARN] No data for {sym}: got {len(rows) if rows else 0} rows, falling back to synthetic")
-        rows = gen_ohlcv(info, months=9)  # Fallback to synthetic
+        print(f"[WARN] No Zerodha data for {sym}: got {len(rows) if rows else 0} rows")
+        return None, None
     try:
         inds = compute_indicators(rows)
     except Exception as e:
@@ -1050,6 +1193,35 @@ def get_swing_signals():
     conn.close()
     return jsonify({"signals": signals, "current": current})
 
+@app.route("/api/sector-intelligence")
+def sector_intelligence():
+    """Get all stocks analyzed and ranked by AI probability score across all sectors."""
+    conn = get_db()
+    cur = conn.execute("""
+        SELECT symbol, company, sector, direction, score, live_price, entry_price, sl, t1, t2,
+               adx, rsi, vol_ratio, risk_pct, trade_type, ai_prediction, ai_confidence, 
+               momentum_score, updated_at, atr, risk_per
+        FROM sector_analysis 
+        ORDER BY (ai_confidence * 0.5 + score * 11.1 * 0.3 + momentum_score * 0.2) DESC
+    """)
+    
+    stocks = []
+    for row in cur.fetchall():
+        s = {
+            "symbol": row[0], "company": row[1], "sector": row[2], "direction": row[3],
+            "score": row[4], "live_price": row[5], "entry_price": row[6], "sl": row[7],
+            "t1": row[8], "t2": row[9], "adx": row[10], "rsi": row[11],
+            "vol_ratio": row[12], "risk_pct": row[13], "trade_type": row[14],
+            "ai_target": row[15], "ai_confidence": row[16], "momentum_score": row[17],
+            "updated_at": row[18], "atr": row[19], "risk_per": row[20]
+        }
+        # Calculate a unified probability score for the UI
+        s["prob_score"] = round((s["ai_confidence"] * 0.5) + (s["score"] * 11.1 * 0.3) + (s["momentum_score"] * 0.2), 1)
+        stocks.append(s)
+    
+    conn.close()
+    return jsonify({"stocks": stocks, "total": len(stocks)})
+
 @app.route("/api/stock-detail/<symbol>")
 def stock_detail(symbol):
     """Get comprehensive details for a specific stock."""
@@ -1161,29 +1333,115 @@ def status():
 
 @app.route("/api/sector/<sector>")
 def get_sector_stocks(sector):
-    """Get detailed analysis for all stocks in a sector."""
+    """Get detailed analysis for all stocks in a sector with AI categorization."""
     conn = get_db()
-    cur = conn.execute("""
+    
+    # 1. Get all stocks from UNIVERSE for this sector
+    # Use fuzzy match for sector names (e.g. "Metal" vs "Metals")
+    sector_norm = sector.strip().rstrip('s').lower() # "Metals" -> "metal"
+    
+    universe_stocks = [u for u in UNIVERSE if u[3].strip().rstrip('s').lower() == sector_norm]
+    universe_symbols = [u[0] for u in universe_stocks]
+    
+    if not universe_stocks:
+        conn.close()
+        return jsonify({"error": f"No stocks found for sector: {sector}"}), 404
+
+    # 2. Get existing analysis for these stocks
+    placeholders = ",".join(["?"] * len(universe_symbols))
+    cur = conn.execute(f"""
         SELECT symbol, company, direction, score, live_price, entry_price, sl, t1, t2,
                adx, rsi, vol_ratio, risk_pct, trade_type, ai_prediction, ai_confidence, 
-               momentum_score, updated_at
+               momentum_score, updated_at, atr, risk_per
         FROM sector_analysis 
-        WHERE sector = ? AND score >= 5
+        WHERE symbol IN ({placeholders})
         ORDER BY momentum_score DESC
-    """, (sector,))
+    """, universe_symbols)
+    
+    analysis_map = {row[0]: dict(row) for row in cur.fetchall()}
     
     stocks = []
-    for row in cur.fetchall():
-        stocks.append({
-            "symbol": row[0], "company": row[1], "direction": row[2], "score": row[3],
-            "live_price": row[4], "entry_price": row[5], "sl": row[6], "t1": row[7], "t2": row[8],
-            "adx": row[9], "rsi": row[10], "vol_ratio": row[11], "risk_pct": row[12],
-            "trade_type": row[13], "ai_target": row[14], "ai_confidence": row[15],
-            "momentum_score": row[16], "updated_at": row[17]
-        })
+    already_moved = []
+    yet_to_move = []
     
+    for info in universe_stocks:
+        sym = info[0]
+        company = info[2]
+        
+        if sym in analysis_map:
+            s = analysis_map[sym]
+            # Ensure price/entry are valid
+            price = s["live_price"] or 0
+            entry = s["entry_price"] or price
+            change = ((price - entry) / entry * 100) if entry > 0 else 0
+            rsi = s["rsi"] or 50
+            
+            # Move Logic
+            is_moved = False
+            if s["direction"] == "LONG":
+                if change > 2.0 or rsi > 60: is_moved = True
+            else:
+                if change < -2.0 or rsi < 40: is_moved = True
+                
+            if is_moved:
+                s["move_status"] = "ALREADY MOVED"
+                s["move_reason"] = f"{abs(change):.1f}% move from entry"
+                already_moved.append(s)
+            else:
+                s["move_status"] = "YET TO MOVE"
+                if s["ai_confidence"] >= 75: s["move_reason"] = "Primed (High AI Conviction)"
+                elif s["vol_ratio"] >= 1.3: s["move_reason"] = "Accumulating (High Volume)"
+                else: s["move_reason"] = "Consolidating near entry"
+                yet_to_move.append(s)
+        else:
+            # Not analyzed yet - create placeholder
+            s = {
+                "symbol": sym, "company": company, "direction": "NEUTRAL", "score": 0,
+                "live_price": 0, "entry_price": 0, "sl": 0, "t1": 0, "t2": 0,
+                "adx": 0, "rsi": 50, "vol_ratio": 1.0, "risk_pct": 0,
+                "trade_type": "PENDING", "ai_target": 0, "ai_confidence": 0,
+                "momentum_score": 0, "updated_at": None, "atr": 0, "risk_per": 0,
+                "move_status": "YET TO MOVE", "move_reason": "Pending Analysis"
+            }
+            yet_to_move.append(s)
+            
+        stocks.append(s)
+    
+    # Probable Mover Logic
+    probable_mover = None
+    if yet_to_move:
+        # Prioritize yet_to_move
+        yet_to_move.sort(key=lambda x: (x["ai_confidence"] * 0.5 + x["score"] * 5), reverse=True)
+        if yet_to_move[0]["score"] > 0:
+            probable_mover = yet_to_move[0]
+            m = probable_mover
+            reasoning = []
+            if m["score"] >= 7: reasoning.append(f"Strong setup ({m['score']}/9)")
+            if m["ai_confidence"] >= 75: reasoning.append(f"AI Conviction {m['ai_confidence']}%")
+            if m["vol_ratio"] >= 1.3: reasoning.append("Volume rising")
+            m["reasoning"] = " · ".join(reasoning) if reasoning else "Early breakout phase"
+
+    # Sector Outlook
+    bullish_count = len([s for s in stocks if s["direction"] == "LONG"])
+    bearish_count = len([s for s in stocks if s["direction"] == "SHORT"])
+    analyzed_stocks = [s for s in stocks if s["score"] > 0]
+    avg_score = sum([s["score"] for s in analyzed_stocks]) / len(analyzed_stocks) if analyzed_stocks else 0
+    
+    outlook = "NEUTRAL"
+    if avg_score >= 6.0: outlook = "BULLISH"
+    elif avg_score <= 4.0 and avg_score > 0: outlook = "BEARISH"
+
     conn.close()
-    return jsonify({"sector": sector, "stocks": stocks, "count": len(stocks)})
+    return jsonify({
+        "sector": sector, 
+        "stocks": stocks,
+        "already_moved": already_moved,
+        "yet_to_move": yet_to_move,
+        "count": len(stocks),
+        "probable_mover": probable_mover,
+        "outlook": outlook,
+        "sentiment": {"bullish": bullish_count, "bearish": bearish_count}
+    })
 
 @app.route("/api/ai-predictions")
 def get_ai_predictions():
@@ -1211,6 +1469,8 @@ def config_route():
     if request.method == "POST":
         cfg = gcfg()
         cfg.update(request.json or {})
+        cfg["use_real"] = True
+        cfg["use_zerodha_ltp"] = True
         scfg(cfg)
         clear_cache()
         return jsonify({"ok": True})
@@ -1223,7 +1483,7 @@ def refresh_data():
     cfg = gcfg()
     cfg["use_real"] = True
     scfg(cfg)
-    return jsonify({"ok": True, "message": "Cache cleared, using REAL data from Yahoo Finance"})
+    return jsonify({"ok": True, "message": "Cache cleared, using REAL data from Zerodha Kite"})
 
 @app.route("/api/ltp-stream")
 def ltp_stream():
@@ -1381,6 +1641,7 @@ def scanner_cached():
     query = """
         SELECT symbol, company, sector, direction, score, live_price, entry_price, 
                sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, 
+               e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
                ai_prediction, ai_confidence, momentum_score, updated_at
         FROM sector_analysis 
         WHERE 1=1
@@ -1392,6 +1653,23 @@ def scanner_cached():
         query += " AND score >= 7 AND adx >= 20 AND vol_ratio >= 1.0"
     elif quality == "high":
         query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.5"
+    elif quality == "elite":
+        query += """
+            AND score >= 8
+            AND adx >= 25
+            AND vol_ratio >= 1.2
+            AND ai_confidence >= 70
+            AND entry_price > 0
+            AND live_price > 0
+            AND abs((live_price - entry_price) / entry_price) <= 0.012
+            AND va_low > 0 AND va_high > 0
+            AND live_price BETWEEN va_low AND va_high
+            AND (
+                (direction = 'LONG' AND st_dir = 1)
+                OR
+                (direction = 'SHORT' AND st_dir = -1)
+            )
+        """
     else:
         # Default behavior: show everything that has been scanned
         if ms > 0:
@@ -1418,8 +1696,12 @@ def scanner_cached():
             "score": row[4], "live_price": row[5], "entry": row[6], "sl": row[7],
             "t1": row[8], "t2": row[9], "t3": row[10], "adx": row[11], "rsi": row[12],
             "vol_ratio": row[13], "risk_pct": row[14], "risk_per": row[15], "atr": row[16],
-            "recommended": row[17], "ai_target": row[18], "ai_confidence": row[19], 
-            "momentum_score": row[20], "updated_at": row[21]
+            "recommended": row[17],
+            "e20": row[18], "e50": row[19], "e200": row[20],
+            "supertrend": row[21], "st_dir": row[22],
+            "vwap": row[23], "poc": row[24], "va_low": row[25], "va_high": row[26],
+            "ai_target": row[27], "ai_confidence": row[28],
+            "momentum_score": row[29], "updated_at": row[30]
         })
     conn.close()
     

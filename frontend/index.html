@@ -1926,6 +1926,124 @@ td:first-child {
 .history-sym { font-weight: 700; font-size: 13px; }
 .history-res { font-weight: 800; font-size: 13px; }
 
+/* ====== SECTOR INTELLIGENCE ====== */
+.intel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+  gap: 20px;
+}
+
+.intel-card {
+  background: white;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  padding: 24px;
+  position: relative;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.intel-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 12px 30px rgba(0,0,0,0.08);
+  border-color: var(--primary);
+}
+
+.intel-prob-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 8px 16px;
+  background: var(--primary-dark);
+  color: white;
+  font-size: 14px;
+  font-weight: 800;
+  border-bottom-left-radius: 20px;
+}
+
+.intel-rank {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  width: 24px;
+  height: 24px;
+  background: var(--bg-secondary);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--text-muted);
+}
+
+.intel-header {
+  margin-top: 8px;
+  margin-bottom: 20px;
+  padding-left: 32px;
+}
+
+.intel-sym {
+  font-size: 24px;
+  font-weight: 800;
+  color: var(--text-primary);
+}
+
+.intel-sector {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.intel-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.intel-stat {
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  text-align: center;
+}
+
+.intel-stat-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.intel-stat-val {
+  font-family: 'JetBrains Mono';
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.intel-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 16px;
+  border-top: 1px dashed var(--border);
+}
+
+.intel-dir {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.intel-dir.long { background: rgba(16,185,129,0.1); color: #059669; }
+.intel-dir.short { background: rgba(239,68,68,0.1); color: #dc2626; }
+
 /* Toast */
 .toast-container {
   position: fixed;
@@ -2421,6 +2539,10 @@ td:first-child {
           <span class="nav-icon">🌡️</span>
           <span>Sector Heatmap</span>
         </div>
+        <div class="nav-item" onclick="nav('sector-intel')">
+          <span class="nav-icon">🧠</span>
+          <span>Sector Intelligence</span>
+        </div>
         <div class="nav-item" onclick="nav('oispikes')">
           <span class="nav-icon">📈</span>
           <span>OI Spikes</span>
@@ -2709,9 +2831,9 @@ td:first-child {
           <div>
             <label class="form-label">Min Score</label>
             <select id="sig-min" onchange="loadSignals()">
-              <option value="5" selected>≥ 5/9</option>
-              <option value="6">≥ 6/9</option>
-              <option value="7">≥ 7/9</option>
+              <option value="7" selected>≥ 7/9 (Prime)</option>
+              <option value="8">≥ 8/9 (High)</option>
+              <option value="9">= 9/9 (Ultra)</option>
             </select>
           </div>
           <div>
@@ -2887,6 +3009,21 @@ td:first-child {
         <button class="btn btn-primary btn-lg" onclick="loadHeatmap()" style="margin-bottom: 28px;">↻ Refresh Heatmap</button>
         <div class="sector-grid" id="heatmap-grid">
           <div class="empty-state"><div class="empty-icon">🌡️</div><p>Click refresh to load</p></div>
+        </div>
+      </div>
+
+      <!-- SECTOR INTELLIGENCE -->
+      <div class="page" id="page-sector-intel">
+        <div class="filters-bar">
+          <div style="display:flex; align-items:center; gap:16px;">
+            <div style="background:var(--primary); color:white; padding:8px 16px; border-radius:12px; font-weight:800; font-size:12px;">AI PROBABILITY RANKING</div>
+            <div style="font-size:13px; color:var(--text-muted);">Highest probability stocks across all sectors ranked by AI Ensemble</div>
+          </div>
+          <button class="btn btn-primary" onclick="loadSectorIntel()">↻ Refresh Intelligence</button>
+        </div>
+
+        <div class="intel-grid" id="intel-stocks-grid">
+          <div class="loading"><div class="spinner"></div></div>
         </div>
       </div>
 
@@ -3133,6 +3270,10 @@ function nav(page) {
   // Special case for stock detail - don't use cache
   if (page === 'stock-detail') return;
 
+  if (page === 'sector-intel') {
+    loadSectorIntel();
+  }
+  
   // Use cached data if available
   if (page === 'dashboard' && dashboardData.length > 0) {
     renderDashboard(); return;
@@ -3356,6 +3497,70 @@ function startAlertPolling() {
 // ==================== DASHBOARD ====================
 var dashboardLoaded = false;
 
+async function loadSectorIntel() {
+  var grid = document.getElementById('intel-stocks-grid');
+  grid.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+  
+  var res = await api('/sector-intelligence');
+  if (res.error) {
+    grid.innerHTML = '<div class="empty-state">Error: ' + res.error + '</div>';
+    return;
+  }
+  
+  var stocks = res.stocks || [];
+  if (stocks.length === 0) {
+    grid.innerHTML = '<div class="empty-state">No analyzed stocks found. Start a scan first.</div>';
+    return;
+  }
+  
+  var html = '';
+  stocks.forEach(function(s, idx) {
+    var dirClass = s.direction === 'LONG' ? 'long' : 'short';
+    var price = s.live_price || 0;
+    
+    html += `
+      <div class="intel-card" onclick="showStockDetail('${s.symbol}')">
+        <div class="intel-rank">#${idx + 1}</div>
+        <div class="intel-prob-badge">${s.prob_score}% PROB</div>
+        
+        <div class="intel-header">
+          <div class="intel-sym">${s.symbol}</div>
+          <div class="intel-sector">${s.sector}</div>
+        </div>
+        
+        <div class="intel-body">
+          <div class="intel-stat">
+            <div class="intel-stat-label">AI Conviction</div>
+            <div class="intel-stat-val" style="color:var(--primary)">${s.ai_confidence}%</div>
+          </div>
+          <div class="intel-stat">
+            <div class="intel-stat-label">Tech Score</div>
+            <div class="intel-stat-val" style="color:var(--accent)">${s.score}/9</div>
+          </div>
+          <div class="intel-stat">
+            <div class="intel-stat-label">Current Price</div>
+            <div class="intel-stat-val">₹${price.toLocaleString('en-IN')}</div>
+          </div>
+          <div class="intel-stat">
+            <div class="intel-stat-label">Volume Ratio</div>
+            <div class="intel-stat-val">${s.vol_ratio.toFixed(2)}x</div>
+          </div>
+        </div>
+        
+        <div class="intel-footer">
+          <div class="intel-dir ${dirClass}">${s.direction}</div>
+          <div style="font-size:11px; color:var(--text-muted);">
+            <b>Entry:</b> ₹${s.entry_price.toLocaleString('en-IN')}
+          </div>
+        </div>
+      </div>
+    `;
+  });
+  
+  grid.innerHTML = html;
+  showToast(stocks.length + ' stocks ranked by AI probability', 'success');
+}
+
 async function loadDashboard() {
   // Show loading state but allow interaction
   document.getElementById('top-signals').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
@@ -3570,8 +3775,12 @@ async function showStockDetail(symbol) {
           <div class="analysis-list">
             <div class="analysis-item"><span>ATR (Volatility)</span><span>${(a.atr || 0).toFixed(2)}</span></div>
             <div class="analysis-item"><span>Volume Ratio</span><span>${a.vol_ratio.toFixed(2)}x</span></div>
-            <div class="analysis-item"><span>EMA 20</span><span>₹${(a.live_price * 0.98).toFixed(2)}</span></div>
-            <div class="analysis-item"><span>EMA 50</span><span>₹${(a.live_price * 0.95).toFixed(2)}</span></div>
+            <div class="analysis-item"><span>EMA 20</span><span>₹${(a.e20 || 0).toFixed(2)}</span></div>
+            <div class="analysis-item"><span>EMA 50</span><span>₹${(a.e50 || 0).toFixed(2)}</span></div>
+            <div class="analysis-item"><span>EMA 200</span><span>₹${(a.e200 || 0).toFixed(2)}</span></div>
+            <div class="analysis-item"><span>VWAP (20)</span><span>₹${(a.vwap || 0).toFixed(2)}</span></div>
+            <div class="analysis-item"><span>POC (VP)</span><span>₹${(a.poc || 0).toFixed(2)}</span></div>
+            <div class="analysis-item"><span>Value Area</span><span>₹${(a.va_low || 0).toFixed(2)} - ₹${(a.va_high || 0).toFixed(2)}</span></div>
           </div>
         </div>
         <div class="analysis-section">
@@ -3579,8 +3788,8 @@ async function showStockDetail(symbol) {
           <div class="analysis-list">
             <div class="analysis-item"><span>Ensemble Bias</span><span>${a.direction}</span></div>
             <div class="analysis-item"><span>Predictive Score</span><span>${a.ai_confidence}/100</span></div>
-            <div class="analysis-item"><span>Market Regime</span><span>BULLISH</span></div>
-            <div class="analysis-item"><span>Institutional Flow</span><span>HIGH</span></div>
+            <div class="analysis-item"><span>Market Regime</span><span>${(a.live_price > (a.e200 || 0) && a.adx >= 20) ? 'BULLISH' : (a.live_price < (a.e200 || 0) && a.adx >= 20) ? 'BEARISH' : 'SIDEWAYS'}</span></div>
+            <div class="analysis-item"><span>Flow (Volume)</span><span>${a.vol_ratio >= 2 ? 'VERY HIGH' : a.vol_ratio >= 1.5 ? 'HIGH' : a.vol_ratio >= 1.1 ? 'RISING' : 'NORMAL'}</span></div>
           </div>
         </div>
       </div>
@@ -3605,7 +3814,7 @@ async function showStockDetail(symbol) {
       <div class="sidebar-card" style="background:var(--primary-dark); color:white;">
         <div class="sidebar-title" style="color:rgba(255,255,255,0.7)">AI Recommendation</div>
         <div style="font-size:14px; line-height:1.6;">
-          Based on current volume profile and institutional order flow, <b>${a.symbol}</b> shows a <b>${a.ai_confidence}%</b> probability of reaching Target 1 within the next 3 sessions.
+          <b>${a.symbol}</b> is ranked at <b>${a.ai_confidence}%</b> confidence with Volume Ratio <b>${a.vol_ratio.toFixed(2)}x</b>. Volume Profile POC is <b>₹${(a.poc || 0).toFixed(2)}</b> with Value Area <b>₹${(a.va_low || 0).toFixed(2)} - ₹${(a.va_high || 0).toFixed(2)}</b>.
         </div>
         <button class="btn btn-primary" style="width:100%; margin-top:20px; background:white; color:var(--primary-dark);" onclick="showToast('Alert set for ${a.symbol}')">🔔 Set Price Alert</button>
       </div>
@@ -3729,13 +3938,15 @@ function showSignalDetail(sym) {
 var signalData = [];
 
 async function loadSignals(highlightSym) {
-  var min = parseInt(document.getElementById('sig-min').value) || 0;
+  var min = parseInt(document.getElementById('sig-min').value) || 7;
   var type = document.getElementById('sig-type') ? document.getElementById('sig-type').value : '';
   
   document.getElementById('signals-grid').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
   
   // Get signals from DB
-  var scanner = await api('/scanner-cached?min_score=' + min + (type ? '&type=' + type : ''));
+  var quality = min >= 9 ? 'elite' : min >= 8 ? 'high' : 'prime';
+  if (highlightSym) quality = 'all';
+  var scanner = await api('/scanner-cached?quality=' + quality + '&min_score=' + min + (type ? '&type=' + type : ''));
   
   if (scanner.error) { 
     document.getElementById('signals-grid').innerHTML = '<div class="empty-state"><div class="empty-icon">❌</div><p>Error loading signals</p></div>';
@@ -3747,6 +3958,18 @@ async function loadSignals(highlightSym) {
   // Filter by type and highlight
   if (type) signalData = signalData.filter(s => s.recommended === type);
   if (highlightSym) signalData = signalData.filter(s => s.symbol === highlightSym);
+  
+  // Additional refinement for Signals page (avoid chasing moves)
+  if (!highlightSym) {
+    signalData = signalData.filter(function(s) {
+      if (!s || !s.entry || !s.live_price) return false;
+      if (s.ai_confidence !== undefined && s.ai_confidence < 60) return false;
+      if (s.vol_ratio !== undefined && s.vol_ratio < 1.1) return false;
+      if (s.adx !== undefined && s.adx < 20) return false;
+      var diff = Math.abs((s.live_price - s.entry) / s.entry);
+      return diff <= 0.012;
+    });
+  }
   
   if (signalData.length === 0) {
     document.getElementById('signals-grid').innerHTML = '<div class="empty-state"><div class="empty-icon">⚡</div><p>No signals found</p></div>';
@@ -4460,7 +4683,7 @@ async function loadChartSymbols() {
 var sectorModalOpen = false;
 
 async function loadSectorAnalysis(sector) {
-  showToast('Loading ' + sector + ' analysis...', 'info');
+  showToast('AI Analyzing ' + sector + ' sector...', 'info');
   
   var data = await api('/sector/' + encodeURIComponent(sector));
   if (data.error) { showToast('Error loading sector', 'error'); return; }
@@ -4470,55 +4693,98 @@ async function loadSectorAnalysis(sector) {
     return;
   }
   
-  // Sort by momentum score
-  data.stocks.sort(function(a, b) { return (b.momentum_score || 0) - (a.momentum_score || 0); });
+  var mover = data.probable_mover;
+  var sentiment = data.sentiment || {bullish:0, bearish:0};
+  var outlook = data.outlook || 'NEUTRAL';
+  var outlookColor = outlook.includes('BULLISH') ? 'var(--success)' : outlook.includes('BEARISH') ? 'var(--danger)' : 'var(--text-muted)';
   
   var html = '<div class="sector-analysis-modal">' +
     '<div class="sector-analysis-header">' +
-      '<h2>📊 ' + sector + '</h2>' +
-      '<p>' + data.stocks.length + ' stocks · Click any stock for AI analysis</p>' +
-    '</div>' +
-    '<div class="sector-stocks-grid">';
-  
-  data.stocks.forEach(function(s, idx) {
-    var dirClass = s.direction === 'LONG' ? 'long' : 'short';
-    var momentumPct = s.momentum_score || 0;
-    var aiConf = s.ai_confidence || 0;
-    
-    html += '<div class="stock-analysis-card ' + dirClass + '" onclick="showStockAI(\'' + s.symbol + '\', ' + idx + ')" style="animation-delay:' + (idx * 0.05) + 's">' +
-      '<div class="stock-an-header">' +
-        '<div class="stock-an-symbol">' + s.symbol + '</div>' +
-        '<div class="stock-an-dir ' + dirClass + '">' + s.direction + '</div>' +
-      '</div>' +
-      '<div class="stock-an-company">' + s.company + '</div>' +
-      '<div class="stock-an-price">₹' + (s.live_price || 0).toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div>' +
-      '<div class="stock-an-entry">Entry: ₹' + (s.entry_price || 0).toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div>' +
-      '<div class="stock-an-meters">' +
-        '<div class="meter-row">' +
-          '<div class="meter-label">Score</div>' +
-          '<div class="meter-bar"><div class="meter-fill score" style="width:' + (s.score * 11.1) + '%"></div></div>' +
-          '<div class="meter-value">' + s.score + '/9</div>' +
+      '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">' +
+        '<div>' +
+          '<h2 style="margin:0;">📊 ' + sector + ' Sector Intelligence</h2>' +
+          '<div style="font-size:14px; color:var(--text-muted); margin-top:4px;">' + data.stocks.length + ' stocks under continuous AI monitoring</div>' +
         '</div>' +
-        '<div class="meter-row">' +
-          '<div class="meter-label">Momentum</div>' +
-          '<div class="meter-bar"><div class="meter-fill momentum" style="width:' + momentumPct + '%"></div></div>' +
-          '<div class="meter-value">' + momentumPct.toFixed(0) + '%</div>' +
-        '</div>' +
-        '<div class="meter-row">' +
-          '<div class="meter-label">AI Confidence</div>' +
-          '<div class="meter-bar"><div class="meter-fill ai" style="width:' + aiConf + '%"></div></div>' +
-          '<div class="meter-value">' + aiConf + '%</div>' +
+        '<div style="text-align:right;">' +
+          '<div style="font-size:11px; font-weight:800; color:var(--text-muted); text-transform:uppercase;">Sector Outlook</div>' +
+          '<div style="font-size:20px; font-weight:800; color:' + outlookColor + ';">' + outlook + '</div>' +
         '</div>' +
       '</div>' +
-      '<div class="stock-an-levels">' +
-        '<div>SL: <span class="red">₹' + (s.sl || 0).toLocaleString('en-IN') + '</span></div>' +
-        '<div>T1: <span class="green">₹' + (s.t1 || 0).toLocaleString('en-IN') + '</span></div>' +
-        '<div>T2: <span class="green">₹' + (s.t2 || 0).toLocaleString('en-IN') + '</span></div>' +
+      
+      '<div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:16px; margin-bottom:24px;">' +
+        '<div style="background:rgba(16,185,129,0.05); padding:12px; border-radius:12px; text-align:center; border:1px solid rgba(16,185,129,0.1);">' +
+          '<div style="font-size:10px; font-weight:700; color:#059669; text-transform:uppercase;">Bullish Setup</div>' +
+          '<div style="font-size:24px; font-weight:800; color:#059669;">' + sentiment.bullish + '</div>' +
+        '</div>' +
+        '<div style="background:rgba(239,68,68,0.05); padding:12px; border-radius:12px; text-align:center; border:1px solid rgba(239,68,68,0.1);">' +
+          '<div style="font-size:10px; font-weight:700; color:#dc2626; text-transform:uppercase;">Bearish Setup</div>' +
+          '<div style="font-size:24px; font-weight:800; color:#dc2626;">' + sentiment.bearish + '</div>' +
+        '</div>' +
+        '<div style="background:var(--bg-secondary); padding:12px; border-radius:12px; text-align:center; border:1px solid var(--border);">' +
+          '<div style="font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase;">Total Stocks</div>' +
+          '<div style="font-size:24px; font-weight:800; color:var(--text-primary);">' + data.stocks.length + '</div>' +
+        '</div>' +
+      '</div>';
+
+  if (mover) {
+    var mDirClass = mover.direction === 'LONG' ? 'long' : 'short';
+    html += '<div class="probable-mover-card ' + mDirClass + '">' +
+      '<div style="position:absolute; top:-12px; right:20px; background:var(--primary); color:white; font-size:10px; font-weight:800; padding:4px 12px; border-radius:20px; box-shadow:0 4px 12px rgba(99,102,241,0.3);">🔥 AI TOP PICK</div>' +
+      '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">' +
+        '<div>' +
+          '<div style="font-size:24px; font-weight:800; color:var(--text-primary);">' + mover.symbol + '</div>' +
+          '<div style="font-size:12px; color:var(--text-muted);">' + mover.company + '</div>' +
+        '</div>' +
+        '<div style="text-align:right;">' +
+          '<div style="font-size:24px; font-weight:800; color:var(--text-primary);">₹' + (mover.live_price || 0).toLocaleString('en-IN') + '</div>' +
+          '<div style="font-size:11px; font-weight:700; color:' + (mover.direction === 'LONG' ? 'var(--success)' : 'var(--danger)') + ';">PROBABLE ' + mover.direction + ' MOVE</div>' +
+        '</div>' +
       '</div>' +
+      '<div style="font-size:13px; background:white; padding:12px; border-radius:12px; border:1px dashed var(--border); margin-bottom:16px; line-height:1.5;">' +
+        '<b>AI Reasoning:</b> ' + mover.reasoning +
+      '</div>' +
+      '<div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:12px;">' +
+        '<div><div style="font-size:9px; color:var(--text-muted); text-transform:uppercase;">Entry</div><div style="font-size:14px; font-weight:700;">₹' + mover.entry_price.toLocaleString('en-IN') + '</div></div>' +
+        '<div><div style="font-size:9px; color:var(--text-muted); text-transform:uppercase;">Stop Loss</div><div style="font-size:14px; font-weight:700; color:var(--danger);">₹' + mover.sl.toLocaleString('en-IN') + '</div></div>' +
+        '<div><div style="font-size:9px; color:var(--text-muted); text-transform:uppercase;">Target 1</div><div style="font-size:14px; font-weight:700; color:var(--success);">₹' + mover.t1.toLocaleString('en-IN') + '</div></div>' +
+        '<div><div style="font-size:9px; color:var(--text-muted); text-transform:uppercase;">Confidence</div><div style="font-size:14px; font-weight:700; color:var(--primary);">' + mover.ai_confidence + '%</div></div>' +
+      '</div>' +
+      '<button class="btn btn-primary" style="width:100%; margin-top:20px; height:40px; font-size:13px;" onclick="showStockDetail(\'' + mover.symbol + '\')">View Deep Intelligence Report</button>' +
     '</div>';
-  });
+  }
+
+  // Column layout for Yet to Move and Already Moved
+  html += '<div style="display:grid; grid-template-columns:1fr; gap:32px; margin-top:32px;">';
   
-  html += '</div></div>';
+  if (data.yet_to_move && data.yet_to_move.length > 0) {
+    html += '<div>' +
+      '<h3 style="font-size:16px; font-weight:800; color:var(--success); margin-bottom:20px; display:flex; align-items:center; gap:10px; border-left:5px solid var(--success); padding-left:12px;">' +
+        '🚀 YET TO MOVE <span style="font-size:12px; font-weight:600; background:rgba(16,185,129,0.1); padding:4px 12px; border-radius:6px;">' + data.yet_to_move.length + ' Stocks</span>' +
+      '</h3>' +
+      '<div class="mini-stocks-grid">';
+    
+    data.yet_to_move.forEach(function(s) {
+      var dirClass = s.direction === 'LONG' ? 'long' : 'short';
+      html += renderMiniStockCard(s, dirClass);
+    });
+    html += '</div></div>';
+  }
+
+  if (data.already_moved && data.already_moved.length > 0) {
+    html += '<div>' +
+      '<h3 style="font-size:16px; font-weight:800; color:var(--text-muted); margin-bottom:20px; display:flex; align-items:center; gap:10px; border-left:5px solid var(--text-muted); padding-left:12px;">' +
+        '🏁 ALREADY MOVED <span style="font-size:12px; font-weight:600; background:var(--bg-secondary); padding:4px 12px; border-radius:6px;">' + data.already_moved.length + ' Stocks</span>' +
+      '</h3>' +
+      '<div class="mini-stocks-grid">';
+    
+    data.already_moved.forEach(function(s) {
+      var dirClass = s.direction === 'LONG' ? 'long' : 'short';
+      html += renderMiniStockCard(s, dirClass);
+    });
+    html += '</div></div>';
+  }
+  
+  html += '</div></div>'; // End modal
   
   // Create or update modal
   var modal = document.getElementById('sector-modal');
@@ -4542,41 +4808,91 @@ async function loadSectorAnalysis(sector) {
     var styles = document.createElement('style');
     styles.id = 'sector-modal-styles';
     styles.textContent = `
-      .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
-      .modal-content { background: linear-gradient(145deg, #f8fafc, #fff); border-radius: 20px; padding: 24px; max-width: 95vw; max-height: 90vh; overflow: auto; position: relative; }
-      .modal-close { position: absolute; top: 16px; right: 16px; background: #ef4444; color: white; border: none; width: 36px; height: 36px; border-radius: 50%; font-size: 24px; cursor: pointer; z-index: 10; }
-      .sector-analysis-header { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 2px solid #e2e8f0; }
-      .sector-analysis-header h2 { font-size: 24px; font-weight: 700; color: #1e293b; margin-bottom: 4px; }
-      .sector-analysis-header p { color: #64748b; font-size: 14px; }
-      .sector-stocks-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
-      .stock-analysis-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; cursor: pointer; transition: all 0.3s; animation: fadeInUp 0.4s backwards; }
-      .stock-analysis-card:hover { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(0,0,0,0.12); border-color: #8b5cf6; }
-      .stock-analysis-card.long { border-left: 4px solid #10b981; }
-      .stock-analysis-card.short { border-left: 4px solid #ef4444; }
-      .stock-an-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-      .stock-an-symbol { font-size: 20px; font-weight: 800; color: #1e293b; }
-      .stock-an-dir { padding: 4px 12px; border-radius: 9999px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
-      .stock-an-dir.long { background: #10b981; color: white; }
-      .stock-an-dir.short { background: #ef4444; color: white; }
-      .stock-an-company { font-size: 12px; color: #64748b; margin-bottom: 12px; }
-      .stock-an-price { font-family: 'JetBrains Mono', monospace; font-size: 24px; font-weight: 700; color: #1e293b; }
-      .stock-an-entry { font-size: 12px; color: #64748b; margin-bottom: 16px; }
-      .stock-an-meters { margin-bottom: 16px; }
-      .meter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-      .meter-label { width: 80px; font-size: 11px; color: #64748b; }
-      .meter-bar { flex: 1; height: 8px; background: #e2e8f0; border-radius: 4px; overflow: hidden; }
-      .meter-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
-      .meter-fill.score { background: linear-gradient(90deg, #8b5cf6, #a855f7); }
-      .meter-fill.momentum { background: linear-gradient(90deg, #06b6d4, #10b981); }
-      .meter-fill.ai { background: linear-gradient(90deg, #f59e0b, #ef4444); }
-      .meter-value { width: 50px; font-size: 12px; font-weight: 600; color: #1e293b; text-align: right; }
-      .stock-an-levels { display: flex; gap: 16px; font-size: 12px; color: #64748b; padding-top: 12px; border-top: 1px solid #e2e8f0; }
-      .stock-an-levels .red { color: #ef4444; font-weight: 600; }
-      .stock-an-levels .green { color: #10b981; font-weight: 600; }
-      @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+      .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15,23,42,0.8); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(8px); }
+      .modal-content { background: #f8fafc; border-radius: 24px; padding: 32px; width: 1100px; max-width: 95vw; max-height: 90vh; overflow: auto; position: relative; border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+      .modal-close { position: absolute; top: 20px; right: 20px; background: white; color: #1e293b; border: 1px solid #e2e8f0; width: 32px; height: 32px; border-radius: 50%; font-size: 20px; cursor: pointer; z-index: 10; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+      .modal-close:hover { background: #ef4444; color: white; border-color: #ef4444; }
+      
+      /* NEW SECTOR STOCK CARDS (Matching Image) */
+      .mini-stocks-grid { 
+        display: grid; 
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
+        gap: 24px; 
+        width: 100%; 
+        margin-bottom: 40px;
+      }
+      .mini-stock-card { 
+        background: white; 
+        border-radius: 20px; 
+        padding: 24px; 
+        cursor: pointer; 
+        transition: all 0.2s ease; 
+        position: relative;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+        border: 1px solid #f1f5f9;
+        overflow: hidden;
+      }
+      .mini-stock-card:hover { transform: translateY(-4px); box-shadow: 0 12px 24px rgba(0,0,0,0.1); border-color: #e2e8f0; }
+      .mini-stock-card.long { border-top: 5px solid #10b981; }
+      .mini-stock-card.short { border-top: 5px solid #ef4444; }
+      
+      .ssc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
+      .ssc-sym-box h4 { font-size: 24px; font-weight: 800; margin: 0; line-height: 1; letter-spacing: -0.5px; }
+      .mini-stock-card.long .ssc-sym-box h4 { color: #dc2626; } /* Matching image: Bajfinance is red but Short? Wait. Image shows Bajfinance (Short) is Red. Siemens (Short) is Red. Powergrid (Long) is Green. */
+      .mini-stock-card.short .ssc-sym-box h4 { color: #dc2626; }
+      .mini-stock-card.long .ssc-sym-box h4 { color: #059669; }
+      
+      .ssc-sub { font-size: 12px; color: #94a3b8; margin-top: 4px; font-weight: 500; }
+      
+      .ssc-badge { 
+        font-size: 10px; font-weight: 800; padding: 4px 14px; border-radius: 20px; color: white; text-transform: uppercase;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .mini-stock-card.long .ssc-badge { background: #10b981; }
+      .mini-stock-card.short .ssc-badge { background: #ef4444; }
+      
+      .ssc-levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+      .ssc-label { font-size: 9px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+      .ssc-val { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 800; color: #1e293b; }
+      .mini-stock-card.short .ssc-val.sl { color: #ef4444; }
+      .mini-stock-card.long .ssc-val.sl { color: #ef4444; }
     `;
     document.head.appendChild(styles);
   }
+}
+
+function renderMiniStockCard(s, dirClass) {
+  var price = s.live_price || 0;
+  var entry = s.entry_price || price;
+  var sl = s.sl || 0;
+  var symbol = s.symbol || '';
+  var subText = symbol + '.NS'; // Matching image format
+  
+  return `
+    <div class="mini-stock-card ${dirClass}" onclick="showStockDetail('${symbol}')">
+      <div class="ssc-header">
+        <div class="ssc-sym-box">
+          <h4>${symbol}</h4>
+          <div class="ssc-sub">${subText}</div>
+        </div>
+        <div class="ssc-badge">${s.direction}</div>
+      </div>
+      <div class="ssc-levels">
+        <div class="ssc-level-box">
+          <div class="ssc-label">CURRENT</div>
+          <div class="ssc-val">₹${price.toLocaleString('en-IN')}</div>
+        </div>
+        <div class="ssc-level-box">
+          <div class="ssc-label">ENTRY</div>
+          <div class="ssc-val">₹${entry.toLocaleString('en-IN')}</div>
+        </div>
+        <div class="ssc-level-box">
+          <div class="ssc-label">SL</div>
+          <div class="ssc-val sl">₹${sl.toLocaleString('en-IN')}</div>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function closeSectorModal() {

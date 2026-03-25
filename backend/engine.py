@@ -434,12 +434,7 @@ def fetch_zerodha(symbol, months=9):
         return None
 
 def get_ohlcv(info, months=9, use_real=True):
-    rows = None
-    if use_real:
-        rows = fetch_zerodha(info[0], months)
-    if not rows:
-        rows = gen_ohlcv(info, months)
-    return rows
+    return fetch_zerodha(info[0], months)
 
 # ── INDICATOR ENGINE (pure Python lists) ─────────────────────
 def _ema(values, period):
