@@ -1412,6 +1412,43 @@ td:first-child {
 .scan-num { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); font-weight: 600; }
 .scan-sym { font-weight: 700; font-size: 13px; color: var(--text-primary); }
 .scan-co { font-size: 10px; color: var(--text-muted); }
+.scan-sym-wrap { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.trade-flag {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: white;
+  box-shadow: 0 10px 20px rgba(0,0,0,0.08);
+  border: 1px solid rgba(255,255,255,0.35);
+  min-width: 62px;
+}
+.trade-flag.buy { background: linear-gradient(135deg, #10b981 0%, #059669 100%); }
+.trade-flag.sell { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); }
+.trade-flag::before {
+  content: '';
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-top: 7px solid transparent;
+  border-bottom: 7px solid transparent;
+}
+.trade-flag.buy::before { border-right: 10px solid #10b981; }
+.trade-flag.sell::before { border-right: 10px solid #ef4444; }
+.trade-flag-pulse { animation: flagPulse 1.6s ease-in-out infinite; }
+@keyframes flagPulse {
+  0%, 100% { transform: translateZ(0) scale(1); }
+  50% { transform: translateZ(0) scale(1.05); }
+}
 .scan-ltp { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 14px; color: var(--primary); display: block; }
 .scan-chg { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600; }
 .scan-entry { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 13px; color: var(--text-primary); display: block; }
@@ -2548,6 +2585,10 @@ td:first-child {
           <span>OI Spikes</span>
           <span class="nav-badge" id="oi-badge" style="display:none;">!</span>
         </div>
+        <div class="nav-item" onclick="nav('hero-zero')">
+          <span class="nav-icon">🎯</span>
+          <span>Hero/Zero (Options)</span>
+        </div>
       </div>
       
       <div class="nav-section">
@@ -2563,6 +2604,10 @@ td:first-child {
         <div class="nav-item" onclick="nav('journal')">
           <span class="nav-icon">📓</span>
           <span>Signal History</span>
+        </div>
+        <div class="nav-item" onclick="nav('whatsapp')">
+          <span class="nav-icon">💬</span>
+          <span>WhatsApp</span>
         </div>
       </div>
     </nav>
@@ -3104,6 +3149,66 @@ td:first-child {
         </div>
       </div>
 
+      <!-- HERO/ZERO OPTIONS -->
+      <div class="page" id="page-hero-zero">
+        <div class="filters-bar">
+          <div>
+            <label class="form-label">Index</label>
+            <select id="hz-index">
+              <option value="NIFTY">NIFTY</option>
+              <option value="BANKNIFTY">BANKNIFTY</option>
+            </select>
+          </div>
+          <div>
+            <label class="form-label">Mode</label>
+            <select id="hz-mode">
+              <option value="HERO" selected>Hero Only</option>
+              <option value="ALL">All (Hero/Zero)</option>
+            </select>
+          </div>
+          <button class="btn btn-primary btn-lg" onclick="loadHeroZero(true)">⚡ Scan Hero/Zero</button>
+          <button class="btn btn-success btn-lg" onclick="sendWhatsApp()">📨 Send WhatsApp Alert</button>
+        </div>
+
+        <div class="stats-grid stats-grid-4" style="margin-bottom: 24px;">
+          <div class="stat-card"><div class="value" id="hz-top">--</div><div class="label">Top Pick</div></div>
+          <div class="stat-card green"><div class="value" id="hz-hero">--</div><div class="label">Hero</div></div>
+          <div class="stat-card red"><div class="value" id="hz-zero">--</div><div class="label">Zero</div></div>
+          <div class="stat-card purple"><div class="value" id="hz-expiry">--</div><div class="label">Expiry</div></div>
+        </div>
+
+        <div id="hz-top-card" style="margin-bottom:20px;"></div>
+
+        <div class="card">
+          <div class="table-wrap">
+            <table class="scan-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Contract</th>
+                  <th>LTP</th>
+                  <th>ΔOI%</th>
+                  <th>ΔP%</th>
+                  <th>OI</th>
+                  <th>Vol</th>
+                  <th>Signal</th>
+                  <th>Score</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="hz-table">
+                <tr><td colspan="10" style="text-align:center;padding:60px;">
+                  <div class="empty-state">
+                    <div class="empty-icon">🎯</div>
+                    <p>Click "Scan Hero/Zero" to detect sudden OI shifts</p>
+                  </div>
+                </td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <!-- CALCULATOR -->
       <div class="page" id="page-calc">
         <div class="stats-grid stats-grid-2">
@@ -3174,6 +3279,45 @@ td:first-child {
         </div>
       </div>
 
+      <div class="page" id="page-whatsapp">
+        <div class="card" style="margin-bottom: 20px;">
+          <div class="card-title">WhatsApp Settings</div>
+          <div style="color:var(--text-muted); font-size:12px; line-height:1.6;">
+            Paste your WhatsApp provider API key in the config. Current integration uses CallMeBot WhatsApp API.
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom: 20px;">
+          <div class="card-title">Configuration (JSON)</div>
+          <div class="form-group">
+            <textarea id="wa-config" style="width:100%; min-height: 260px; font-family: JetBrains Mono, monospace; font-size: 12px; padding: 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg-secondary);"></textarea>
+          </div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <button class="btn btn-primary" onclick="saveWhatsAppConfig()">💾 Save</button>
+            <button class="btn btn-outline" onclick="loadWhatsAppConfig()">↻ Reload</button>
+            <button class="btn btn-success" onclick="testWhatsApp()">✅ Send Test</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Test Message</div>
+          <div class="stats-grid stats-grid-3">
+            <div class="form-group">
+              <label class="form-label">Kind</label>
+              <select id="wa-kind">
+                <option value="alerts">alerts</option>
+                <option value="signals">signals</option>
+                <option value="options">options</option>
+              </select>
+            </div>
+            <div class="form-group" style="grid-column: span 2;">
+              <label class="form-label">Text</label>
+              <input id="wa-text" value="Hello from APEX v7" />
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- RISK -->
       <div class="page" id="page-risk">
         <div class="card" style="margin-bottom: 28px;">
@@ -3236,6 +3380,8 @@ var currentMode = 'SWING';
 var stockData = [];
 var dashboardData = [];
 var signalData = [];
+var livePriceInterval = null;
+var lastLiveUpdateAt = 0;
 var alerts = [];
 var alertPollTimer = null;
 var dataCache = { dashboard: null, signals: null, scanner: null };
@@ -3247,9 +3393,10 @@ function nav(page) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById('page-' + page).classList.add('active');
   
-  var navItems = document.querySelectorAll('.nav-item');
-  var pageMap = {dashboard:0, scanner:1, signals:2, swing:3, momentum:4, intraday:5, heatmap:6, oispikes:7, backtest:8, risk:9, journal:10};
-  if (navItems[pageMap[page]]) navItems[pageMap[page]].classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(function(n) {
+    var oc = n.getAttribute('onclick') || '';
+    if (oc.indexOf("nav('" + page + "')") !== -1) n.classList.add('active');
+  });
   
   var titles = {
     dashboard:'Dashboard', 
@@ -3259,10 +3406,13 @@ function nav(page) {
     swing:'Swing Trades', 
     intraday:'Intraday', 
     heatmap:'Sector Heatmap', 
+    'sector-intel':'Sector Intelligence',
     oispikes:'OI Spikes', 
+    'hero-zero':'Hero/Zero (Options)',
     backtest:'Backtest', 
     risk:'Risk Calculator', 
     journal:'Signal History',
+    whatsapp:'WhatsApp',
     'stock-detail': 'Stock Intelligence Detail'
   };
   document.getElementById('page-title').textContent = titles[page] || 'Dashboard';
@@ -3294,7 +3444,9 @@ function nav(page) {
   if (page === 'charts') loadChartSymbols();
   if (page === 'heatmap') loadHeatmap();
   if (page === 'oispikes') loadOiSpikes();
+  if (page === 'hero-zero') loadHeroZero(false);
   if (page === 'journal') loadJournal();
+  if (page === 'whatsapp') loadWhatsAppConfig();
 }
 
 function api(path) {
@@ -3907,10 +4059,15 @@ function filterStocks() {
     var entryDiff = price - s.entry;
     var entryNote = Math.abs(entryDiff) < 1 ? 'AT' : (entryDiff > 0 ? '↓' : '↑');
     var entryNoteColor = Math.abs(entryDiff) < 1 ? 'var(--text-muted)' : chgColor;
+    var aiConf = s.ai_confidence || 0;
+    var stDir = (s.st_dir === undefined || s.st_dir === null) ? 0 : s.st_dir;
+    var stAligned = stDir === 0 ? true : (s.direction === 'LONG' ? stDir === 1 : stDir === -1);
+    var highAccuracy = (s.score >= 8) && (s.adx >= 25) && (s.vol_ratio >= 1.2) && (aiConf >= 70) && stAligned;
+    var flag = highAccuracy ? ('<span class="trade-flag trade-flag-pulse ' + (s.direction === 'LONG' ? 'buy' : 'sell') + '">' + (s.direction === 'LONG' ? 'BUY' : 'SELL') + '</span>') : '';
 
     return '<tr class="' + rowClass + '">' +
       '<td><span class="scan-num">' + cnt + '</span></td>' +
-      '<td><div class="scan-sym-wrap"><span class="scan-sym">' + s.symbol + '</span><br><span class="scan-co">' + s.company + '</span></div></td>' +
+      '<td><div class="scan-sym-wrap"><div><span class="scan-sym">' + s.symbol + '</span><br><span class="scan-co">' + s.company + '</span></div>' + flag + '</div></td>' +
       '<td><span class="scan-ltp">₹' + price.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span><br><span class="scan-chg" style="color:' + chgColor + ';">' + (dayChg >= 0 ? '+' : '') + dayChg.toFixed(2) + '%</span></td>' +
       '<td><span class="scan-entry">₹' + s.entry.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span><br><span class="scan-note" style="color:' + entryNoteColor + ';font-size:9px;">' + entryNote + ' ' + Math.abs(entryDiff).toFixed(2) + '</span></td>' +
       '<td><span class="scan-sl">₹' + s.sl.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
@@ -3983,7 +4140,52 @@ async function loadSignals(highlightSym) {
 function startLivePriceRefresh() {
   if (livePriceInterval) clearInterval(livePriceInterval);
   refreshLivePrices();  // Refresh immediately
-  livePriceInterval = setInterval(refreshLivePrices, 30000);  // Then every 30 seconds
+  livePriceInterval = setInterval(refreshLivePrices, 5000);
+}
+
+async function refreshLivePrices() {
+  var res = await api('/live-prices');
+  if (res.error) return;
+  var prices = res.prices || [];
+  if (prices.length === 0) return;
+  lastLiveUpdateAt = Date.now();
+
+  var map = {};
+  prices.forEach(function(p) { map[p.symbol] = p; });
+
+  function applyTo(arr) {
+    if (!arr || arr.length === 0) return;
+    arr.forEach(function(s) {
+      var lp = map[s.symbol];
+      if (!lp) return;
+      s.live_price = lp.price;
+      s.day_change_pct = lp.day_change_pct;
+      s.vol_ratio = lp.vol_ratio;
+      s.avg_volume = lp.avg_volume;
+      s.volume = lp.volume;
+    });
+  }
+
+  applyTo(dashboardData);
+  applyTo(signalData);
+  applyTo(stockData);
+
+  var liveDot = document.getElementById('live-dot');
+  var liveStatus = document.getElementById('live-status');
+  if (liveDot && liveStatus) {
+    liveStatus.textContent = 'LIVE';
+    liveDot.style.background = 'var(--success)';
+  }
+
+  if (document.getElementById('page-dashboard').classList.contains('active') && dashboardData.length > 0) {
+    renderDashboard();
+  }
+  if (document.getElementById('page-scanner').classList.contains('active') && stockData.length > 0) {
+    renderScanner();
+  }
+  if (document.getElementById('page-signals').classList.contains('active') && signalData.length > 0) {
+    renderSignals();
+  }
 }
 
 function renderSignals() {
@@ -4289,7 +4491,7 @@ async function loadIntraday() {
 
 // ==================== HEATMAP ====================
 async function loadHeatmap() {
-  var scanner = await api('/scanner?min_score=0&refresh=1');
+  var scanner = await api('/scanner-cached?min_score=0');
   if (scanner.error) return;
   
   var secMap = {};
@@ -4308,11 +4510,11 @@ async function loadHeatmap() {
   
   var sorted = Object.keys(secMap).sort(function(a, b) { return secMap[b].avg - secMap[a].avg; });
   
-  document.getElementById('heatmap-grid').innerHTML = sorted.map(function(sec) {
+  document.getElementById('heatmap-grid').innerHTML = sorted.map(function(sec, idx) {
     var m = secMap[sec];
     var bias = m.avg > 5 ? 'bullish' : m.avg < 4 ? 'bearish' : 'neutral';
-    return '<div class="sector-card ' + bias + '">' +
-      '<div class="sector-name">' + sec + '</div>' +
+    return '<div class="sector-card ' + bias + '" onclick="loadSectorAnalysis(\'' + sec + '\')">' +
+      '<div class="sector-name">#' + (idx+1) + ' · ' + sec + '</div>' +
       '<div class="sector-stats">' + m.total + ' stocks · ' + m.prime + ' prime</div>' +
       '<div class="sector-score">' + m.avg.toFixed(1) + '/9</div>' +
       '<div class="progress-bar"><div class="progress-fill" style="width:' + (m.avg/9*100) + '%;"></div></div>' +
@@ -4358,6 +4560,151 @@ async function loadOiSpikes() {
     document.getElementById('oi-table').innerHTML = '<tr><td colspan="14" style="text-align:center;padding:60px;"><div class="empty-state"><div class="empty-icon">⚠️</div><p>Error: ' + e.message + '</p></div></td></tr>';
     showToast('OI scan failed', 'error');
   }
+}
+
+// ==================== HERO/ZERO OPTIONS ====================
+var hzSignals = [];
+
+async function loadHeroZero(forceRefresh) {
+  var idx = document.getElementById('hz-index') ? document.getElementById('hz-index').value : 'NIFTY';
+  var mode = document.getElementById('hz-mode') ? document.getElementById('hz-mode').value : 'HERO';
+  var tbody = document.getElementById('hz-table');
+  if (tbody) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:60px;"><div class="empty-state"><div class="empty-icon spinner">⟳</div><p>Analyzing OI changes...</p></div></td></tr>';
+  }
+  showToast('Scanning ' + idx + ' options for OI shifts...', 'info');
+
+  var path = '/options-hero-zero?index=' + encodeURIComponent(idx) + (forceRefresh ? '&refresh=1' : '');
+  var data = await api(path);
+  if (data.error) {
+    if (tbody) tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:60px;"><div class="empty-state"><div class="empty-icon">⚠️</div><p>Error: ' + data.error + '</p></div></td></tr>';
+    return;
+  }
+
+  hzSignals = data.signals || [];
+  if (mode === 'HERO') hzSignals = hzSignals.filter(function(s){ return s.signal === 'HERO'; });
+
+  document.getElementById('hz-hero').textContent = (data.signals || []).filter(s => s.signal === 'HERO').length;
+  document.getElementById('hz-zero').textContent = (data.signals || []).filter(s => s.signal === 'ZERO').length;
+  document.getElementById('hz-expiry').textContent = (data.meta && data.meta.expiry) ? data.meta.expiry : '--';
+  
+  // Summary CE/PE OI and momentum
+  var sum = data.summary || {};
+  var mom = sum.momentum || 'NEUTRAL';
+  var momColor = mom === 'BULLISH' ? 'var(--success)' : mom === 'BEARISH' ? 'var(--danger)' : 'var(--text-muted)';
+  var sumHtml = '<div class="stats-grid stats-grid-3" style="margin:16px 0;">' +
+    '<div class="stat-card green"><div class="value">' + (sum.ce_total_oi || 0).toLocaleString('en-IN') + '</div><div class="label">CE Total OI</div></div>' +
+    '<div class="stat-card red"><div class="value">' + (sum.pe_total_oi || 0).toLocaleString('en-IN') + '</div><div class="label">PE Total OI</div></div>' +
+    '<div class="stat-card"><div class="value" style="color:' + momColor + ';">' + mom + '</div><div class="label">Momentum</div></div>' +
+  '</div>';
+  document.getElementById('hz-top-card').insertAdjacentHTML('beforeend', sumHtml);
+
+  var top = data.top;
+  document.getElementById('hz-top').textContent = top ? (top.action + ' ' + top.tradingsymbol) : '--';
+
+  var topCard = document.getElementById('hz-top-card');
+  if (topCard) {
+    if (!top) {
+      topCard.innerHTML = '';
+    } else {
+      var color = top.side === 'BULLISH' ? 'var(--success)' : 'var(--danger)';
+      topCard.innerHTML =
+        '<div class="card" style="border-left:6px solid ' + color + ';">' +
+          '<div class="card-title">Top Option to Buy</div>' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;">' +
+            '<div>' +
+              '<div style="font-size:22px;font-weight:900;color:' + color + ';">' + top.action + ' · ' + top.tradingsymbol + '</div>' +
+              '<div style="color:var(--text-muted);font-size:12px;margin-top:4px;">' + (top.reason || '') + '</div>' +
+            '</div>' +
+            '<div style="text-align:right;">' +
+              '<div style="font-family:JetBrains Mono;font-size:24px;font-weight:900;">₹' + (top.ltp || 0).toLocaleString('en-IN') + '</div>' +
+              '<div style="font-size:12px;color:var(--text-muted);">Score: ' + top.score + '</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+    }
+  }
+
+  renderHeroZeroTable();
+  showToast('OI scan loaded: ' + hzSignals.length + ' contracts', 'success');
+}
+
+function renderHeroZeroTable() {
+  var tbody = document.getElementById('hz-table');
+  if (!tbody) return;
+  if (!hzSignals || hzSignals.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:60px;"><div class="empty-state"><div class="empty-icon">🎯</div><p>No signals yet. Wait 1 minute for baseline snapshots, then scan again.</p></div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = hzSignals.map(function(s, i) {
+    var sigColor = s.signal === 'HERO' ? 'var(--success)' : 'var(--danger)';
+    return '<tr>' +
+      '<td>' + (i+1) + '</td>' +
+      '<td><b>' + s.tradingsymbol + '</b><br><span style="font-size:10px;color:var(--text-muted);">' + s.expiry + ' · ' + s.strike + ' ' + s.opt_type + '</span></td>' +
+      '<td>₹' + (s.ltp || 0).toLocaleString('en-IN') + '</td>' +
+      '<td>' + (s.doi_pct || 0).toFixed(2) + '%</td>' +
+      '<td>' + (s.dltp_pct || 0).toFixed(2) + '%</td>' +
+      '<td>' + (s.oi || 0).toLocaleString('en-IN') + '</td>' +
+      '<td>' + (s.volume || 0).toLocaleString('en-IN') + '</td>' +
+      '<td style="font-weight:900;color:' + sigColor + ';">' + s.signal + '</td>' +
+      '<td style="font-weight:800;">' + s.score + '</td>' +
+      '<td><span class="badge ' + (s.signal === 'HERO' ? 'badge-green' : 'badge-red') + '">' + s.action + '</span></td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function sendWhatsApp() {
+  var idx = document.getElementById('hz-index') ? document.getElementById('hz-index').value : 'NIFTY';
+  showToast('Sending WhatsApp alert...', 'info');
+  try {
+    var resp = await api('/whatsapp/send?index=' + encodeURIComponent(idx));
+    if (resp.ok) {
+      showToast('Alert queued', 'success');
+    } else {
+      showToast('Send failed: ' + (resp.error || 'Unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Send failed: ' + e.message, 'error');
+  }
+}
+
+async function loadWhatsAppConfig() {
+  var ta = document.getElementById('wa-config');
+  if (!ta) return;
+  var cfg = await api('/whatsapp/config');
+  if (cfg.error) return;
+  ta.value = JSON.stringify(cfg, null, 2);
+}
+
+async function saveWhatsAppConfig() {
+  var ta = document.getElementById('wa-config');
+  if (!ta) return;
+  var txt = ta.value || '';
+  var data;
+  try {
+    data = JSON.parse(txt);
+  } catch(e) {
+    showToast('Invalid JSON: ' + e.message, 'error');
+    return;
+  }
+  var res = await fetch(API + '/whatsapp/config', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(data)
+  }).then(r => r.json()).catch(e => ({error:e.message}));
+  if (res.error) {
+    showToast('Save failed: ' + res.error, 'error');
+    return;
+  }
+  showToast('WhatsApp config saved', 'success');
+}
+
+async function testWhatsApp() {
+  var kind = document.getElementById('wa-kind') ? document.getElementById('wa-kind').value : 'alerts';
+  var text = document.getElementById('wa-text') ? document.getElementById('wa-text').value : 'Hello from APEX v7';
+  var resp = await api('/whatsapp/test?kind=' + encodeURIComponent(kind) + '&text=' + encodeURIComponent(text));
+  if (resp.error) return;
+  showToast('Test queued: ' + resp.event_key, 'success');
 }
 
 function renderOiAlerts(spikes) {
@@ -4418,11 +4765,11 @@ function filterOiSpikes() {
   });
 
   if (sort === 'chg') {
-    oiFiltered.sort(function(a, b) { return Math.abs(b.price_change_pct) - Math.abs(a.price_change_pct); });
+    oiFiltered.sort(function(a, b) { return Math.abs(Number(b.price_change_pct || 0)) - Math.abs(Number(a.price_change_pct || 0)); });
   } else if (sort === 'score') {
     oiFiltered.sort(function(a, b) { return b.score - a.score; });
   } else {
-    oiFiltered.sort(function(a, b) { return b.vol_ratio - a.vol_ratio; });
+    oiFiltered.sort(function(a, b) { return Number(b.vol_ratio || 0) - Number(a.vol_ratio || 0); });
   }
 
   renderOiTable();
@@ -4438,25 +4785,35 @@ function renderOiTable() {
   var cnt = 0;
   tbody.innerHTML = oiFiltered.map(function(s) {
     cnt++;
-    var chgColor = s.price_change_pct >= 0 ? 'var(--success)' : 'var(--danger)';
-    var volColor = s.vol_ratio >= 3 ? 'var(--warning-dark)' : s.vol_ratio >= 2 ? 'var(--info)' : 'var(--text-secondary)';
-    var spikeClass = s.spike_type === 'BUYING' ? 'badge-green' : s.spike_type === 'SELLING' ? 'badge-red' : s.spike_type === 'HIGH VOL' ? 'badge-yellow' : 'badge-gray';
+    var livePrice = Number(s.live_price || 0);
+    var priceChg = Number(s.price_change_pct || 0);
+    var volRatio = Number(s.vol_ratio || 0);
+    var avgVol = Number(s.avg_volume || 0);
+    var adx = Number(s.adx || 0);
+    var rsi = Number(s.rsi || 0);
+    var entry = Number(s.entry || 0);
+    var sl = Number(s.sl || 0);
+    var riskPer = Number(s.risk_per || 0);
+    var spikeType = s.spike_type || 'NORMAL';
+    var chgColor = priceChg >= 0 ? 'var(--success)' : 'var(--danger)';
+    var volColor = volRatio >= 3 ? 'var(--warning-dark)' : volRatio >= 2 ? 'var(--info)' : 'var(--text-secondary)';
+    var spikeClass = spikeType === 'BUYING' ? 'badge-green' : spikeType === 'SELLING' ? 'badge-red' : spikeType === 'HIGH VOL' ? 'badge-yellow' : 'badge-gray';
     var rowClass = s.direction === 'LONG' ? 'row-long' : 'row-short';
 
     return '<tr class="' + rowClass + '">' +
       '<td><span class="scan-num">' + cnt + '</span></td>' +
       '<td><div><span class="scan-sym">' + s.symbol + '</span><br><span class="scan-co">' + s.company + '</span></div></td>' +
-      '<td><span class="scan-ltp">₹' + s.live_price.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
-      '<td><span class="scan-chg" style="color:' + chgColor + ';">' + (s.price_change_pct >= 0 ? '+' : '') + s.price_change_pct.toFixed(2) + '%</span></td>' +
-      '<td><span style="font-family:JetBrains Mono;font-weight:800;color:' + volColor + ';">' + s.vol_ratio.toFixed(1) + 'x</span></td>' +
-      '<td><span class="scan-note">' + s.avg_volume.toLocaleString('en-IN') + '</span></td>' +
-      '<td><span class="badge ' + spikeClass + '">' + s.spike_type + '</span></td>' +
+      '<td><span class="scan-ltp">₹' + livePrice.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
+      '<td><span class="scan-chg" style="color:' + chgColor + ';">' + (priceChg >= 0 ? '+' : '') + priceChg.toFixed(2) + '%</span></td>' +
+      '<td><span style="font-family:JetBrains Mono;font-weight:800;color:' + volColor + ';">' + volRatio.toFixed(1) + 'x</span></td>' +
+      '<td><span class="scan-note">' + avgVol.toLocaleString('en-IN') + '</span></td>' +
+      '<td><span class="badge ' + spikeClass + '">' + spikeType + '</span></td>' +
       '<td><div class="score-ring ' + (s.score >= 8 ? 'score-high' : s.score >= 7 ? 'score-mid' : 'score-low') + '">' + s.score + '</div></td>' +
-      '<td>' + s.adx + '</td>' +
-      '<td>' + s.rsi + '</td>' +
-      '<td><span class="scan-entry">₹' + s.entry.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
-      '<td><span class="scan-sl">₹' + s.sl.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
-      '<td><span class="scan-risk">₹' + s.risk_per.toLocaleString('en-IN', {minimumFractionDigits: 1}) + '</span></td>' +
+      '<td>' + adx.toFixed(1) + '</td>' +
+      '<td>' + rsi.toFixed(1) + '</td>' +
+      '<td><span class="scan-entry">₹' + entry.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
+      '<td><span class="scan-sl">₹' + sl.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</span></td>' +
+      '<td><span class="scan-risk">₹' + riskPer.toLocaleString('en-IN', {minimumFractionDigits: 1}) + '</span></td>' +
       '<td><span class="badge ' + (s.direction === 'LONG' ? 'badge-green' : 'badge-red') + '">' + s.direction + '</span></td>' +
     '</tr>';
   }).join('');
@@ -4753,6 +5110,25 @@ async function loadSectorAnalysis(sector) {
     '</div>';
   }
 
+  // Ranked list (ALL stocks in sector)
+  var ranked = (data.stocks || []).map(function(s) {
+    var prob = (s.ai_confidence || 0) * 0.5 + (s.score || 0) * 11.1 * 0.3 + (s.momentum_score || 0) * 0.2;
+    s._prob = Math.round(prob);
+    return s;
+  }).sort(function(a, b) { return (b._prob || 0) - (a._prob || 0); });
+  
+  html += '<h3 style="font-size:14px; font-weight:800; color:var(--text-primary); margin:24px 0 16px 0; padding-left:4px; border-left:4px solid var(--accent);">All Sector Stocks (Ranked)</h3>';
+  html += '<div class="mini-stocks-grid">';
+  ranked.forEach(function(s, idx) {
+    var dirClass = s.direction === 'LONG' ? 'long' : (s.direction === 'SHORT' ? 'short' : '');
+    var card = renderMiniStockCard(s, dirClass);
+    // Inject rank badge
+    card = card.replace('<div class="mini-stock-card', '<div class="mini-stock-card');
+    card = card.replace('</div></div>', '<div style="position:absolute; top:10px; right:10px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:9999px; font-size:10px; font-weight:800; padding:4px 10px; color:var(--text-muted);">#' + (idx + 1) + ' · ' + (s._prob || 0) + '%</div></div></div>');
+    html += card;
+  });
+  html += '</div>';
+
   // Column layout for Yet to Move and Already Moved
   html += '<div style="display:grid; grid-template-columns:1fr; gap:32px; margin-top:32px;">';
   
@@ -4915,6 +5291,7 @@ window.onload = function() {
   showToast('Welcome to APEX v7 - LIVE Zerodha Data', 'success');
   loadDashboard();
   startAlertPolling();
+  startLivePriceRefresh();
 };
 </script>
 </body>

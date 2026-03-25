@@ -27,8 +27,14 @@ _cache = {}   # sym -> (rows, inds)
 # ── DATABASE ─────────────────────────────
 def get_db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return conn
 
 def init_db():
@@ -72,6 +78,8 @@ def init_db():
         e20 REAL DEFAULT 0, e50 REAL DEFAULT 0, e200 REAL DEFAULT 0,
         supertrend REAL DEFAULT 0, st_dir INTEGER DEFAULT 0,
         vwap REAL DEFAULT 0, poc REAL DEFAULT 0, va_low REAL DEFAULT 0, va_high REAL DEFAULT 0,
+        index_tag TEXT DEFAULT '',
+        index_weight REAL DEFAULT 0,
         ai_prediction REAL, ai_confidence INTEGER,
         momentum_score INTEGER, updated_at TEXT
     );
@@ -154,6 +162,12 @@ def init_db():
     if "va_high" not in columns:
         print("[DB] Adding missing column 'va_high' to sector_analysis")
         conn.execute("ALTER TABLE sector_analysis ADD COLUMN va_high REAL DEFAULT 0")
+    if "index_tag" not in columns:
+        print("[DB] Adding missing column 'index_tag' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN index_tag TEXT DEFAULT ''")
+    if "index_weight" not in columns:
+        print("[DB] Adding missing column 'index_weight' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN index_weight REAL DEFAULT 0")
         
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS price_cache (
@@ -206,10 +220,53 @@ def init_db():
         equity TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS option_oi_snapshot (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        index_name TEXT,
+        tradingsymbol TEXT,
+        expiry TEXT,
+        strike REAL,
+        opt_type TEXT,
+        ltp REAL,
+        oi INTEGER,
+        volume INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS option_oi_signal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        index_name TEXT,
+        tradingsymbol TEXT,
+        expiry TEXT,
+        strike REAL,
+        opt_type TEXT,
+        ltp REAL,
+        oi INTEGER,
+        doi INTEGER,
+        doi_pct REAL,
+        dltp_pct REAL,
+        signal TEXT,
+        score REAL,
+        side TEXT,
+        reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT UNIQUE,
+        kind TEXT,
+        message TEXT,
+        sent_count INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_signal_date ON signal_log(signal_date);
     CREATE INDEX IF NOT EXISTS idx_signal_symbol ON signal_log(symbol);
     CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_cache(symbol);
     CREATE INDEX IF NOT EXISTS idx_alert_ack ON momentum_alerts(acknowledged);
+    CREATE INDEX IF NOT EXISTS idx_opt_snap_ts ON option_oi_snapshot(ts);
+    CREATE INDEX IF NOT EXISTS idx_opt_snap_sym ON option_oi_snapshot(tradingsymbol);
+    CREATE INDEX IF NOT EXISTS idx_opt_sig_ts ON option_oi_signal(ts);
+    CREATE INDEX IF NOT EXISTS idx_opt_sig_idx ON option_oi_signal(index_name);
+    CREATE INDEX IF NOT EXISTS idx_wa_outbox_kind ON whatsapp_outbox(kind);
     """)
 
     try:
@@ -249,6 +306,20 @@ def init_db():
     conn.commit(); conn.close()
 
 init_db()
+
+# ── INDEX: NIFTY50 WEIGHTS ──────────────────────────
+NIFTY50_WEIGHTS = {
+    "HDFCBANK": 11.54, "RELIANCE": 9.41, "ICICIBANK": 8.12, "INFY": 6.05, "ITC": 3.96,
+    "BHARTIARTL": 4.13, "LT": 4.08, "TCS": 4.07, "AXISBANK": 2.90, "SBIN": 2.78,
+    "KOTAKBANK": 2.46, "M&M": 2.17, "HINDUNILVR": 2.16, "TITAN": 1.76, "SUNPHARMA": 1.77,
+    "BAJFINANCE": 1.98, "HCLTECH": 1.80, "TATAMOTORS": 1.53, "NTPC": 1.57, "ULTRACEMCO": 1.20,
+    "MARUTI": 1.45, "POWERGRID": 1.25, "ASIANPAINT": 1.24, "GRASIM": 1.80, "TATASTEEL": 1.22,
+    "ADANIPORTS": 0.99, "ONGC": 1.05, "COALINDIA": 0.89, "BEL": 0.94, "TECHM": 0.89,
+    "HINDALCO": 0.91, "INDUSINDBK": 0.83, "JSWSTEEL": 1.18, "BAJAJ-AUTO": 1.17, "WIPRO": 0.88,
+    "SHRIRAMFIN": 0.81, "ADANIENT": 0.95, "BAJAJFINSV": 1.24, "NESTLEIND": 0.99, "DRREDDY": 0.67,
+    "CIPLA": 0.68, "APOLLOHOSP": 0.61, "EICHERMOT": 0.83, "HEROMOTOCO": 0.53, "TATACONSUM": 0.68,
+    "BRITANNIA": 0.59, "SBILIFE": 0.70, "HDFCLIFE": 0.67, "TRENT": 1.46, "JIOFIN": 0.89
+}
 
 # ── DATABASE HELPERS ──────────────────────────
 
@@ -321,7 +392,7 @@ def store_momentum_alert(alert_data):
     if existing:
         conn.close()
         return  # Don't duplicate alerts within 5 minutes
-    conn.execute("""
+    cur = conn.execute("""
         INSERT INTO momentum_alerts (symbol, company, sector, alert_type, direction, price, prev_price, change_pct, vol_ratio, score, entry_price, sl, t1, risk_per, adx, rsi)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (alert_data["symbol"], alert_data["company"], alert_data["sector"],
@@ -332,7 +403,12 @@ def store_momentum_alert(alert_data):
           alert_data["sl"], alert_data["t1"],
           alert_data["risk_per"], alert_data["adx"],
           alert_data["rsi"]))
+    alert_id = cur.lastrowid
     conn.commit(); conn.close()
+    try:
+        _maybe_send_whatsapp_alert(alert_data, alert_id)
+    except Exception as e:
+        print(f"[WHATSAPP] alert notify error: {e}")
 
 def get_unacknowledged_alerts():
     """Get all unacknowledged momentum alerts."""
@@ -384,6 +460,10 @@ def log_signal(signal_data):
         conn.commit()
         conn.close()
         print(f"[DB] Logged {signal_data.get('trade_type')} signal: {signal_data['symbol']}")
+        try:
+            _maybe_send_whatsapp_signal(signal_data)
+        except Exception as e:
+            print(f"[WHATSAPP] signal notify error: {e}")
     except Exception as e:
         print(f"[DB ERROR] log_signal: {e}")
 
@@ -398,6 +478,11 @@ def get_signal_log(limit=100):
 # ── BACKGROUND SCANNER ──────────────────────────
 _scanner_running = False
 _scanner_thread = None
+_options_oi_running = False
+_options_oi_thread = None
+_nfo_instruments_cache = {"ts": 0.0, "rows": None}
+_whatsapp_event_cache = {}
+_whatsapp_event_lock = threading.Lock()
 
 def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk_pct, trade_type, meta, ind):
     """Store stock analysis data for sector views and AI predictions."""
@@ -425,8 +510,9 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
             (sector, symbol, company, direction, score, live_price, entry_price, sl, t1, t2, t3,
              adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
              e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
+             index_tag, index_weight,
              ai_prediction, ai_confidence, momentum_score, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             info[3], sym, info[1], direction, score, live_price, levels["entry"],
             levels["sl"], levels["t1"], levels["t2"], levels.get("t3", 0),
@@ -435,6 +521,7 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
             ind.get("st") or 0, ind.get("st_dir") or 0,
             ind.get("vwap") or 0, ind.get("poc") or 0,
             ind.get("va_low") or 0, ind.get("va_high") or 0,
+            ("NIFTY50" if sym in NIFTY50_WEIGHTS else ""), NIFTY50_WEIGHTS.get(sym, 0),
             levels.get("t2", 0), confidence, momentum, now
         ))
         
@@ -503,6 +590,15 @@ def _start_background_scanner():
     t = threading.Thread(target=_background_scanner_loop, daemon=True)
     t.start()
     print("[SCANNER] Background scanner started")
+
+def _start_options_oi_scanner():
+    global _options_oi_running, _options_oi_thread
+    if _options_oi_running:
+        return
+    _options_oi_running = True
+    _options_oi_thread = threading.Thread(target=_options_oi_loop, daemon=True)
+    _options_oi_thread.start()
+    print("[OI] Options OI scanner started")
 
 def _background_scanner_loop():
     """Continuously scan for momentum changes every 60 seconds."""
@@ -637,6 +733,229 @@ def _full_universe_scan():
         
         print(f"[ML] Training models on {scanned_count} symbols with latest market data...")
         _train_models(_ml_data_cache)
+
+def _get_nfo_instruments():
+    now = time.time()
+    if _nfo_instruments_cache["rows"] is not None and (now - _nfo_instruments_cache["ts"]) < 3600:
+        return _nfo_instruments_cache["rows"]
+    kite = _get_zerodha_kite()
+    if not kite:
+        return None
+    rows = kite.instruments("NFO")
+    _nfo_instruments_cache["rows"] = rows
+    _nfo_instruments_cache["ts"] = now
+    return rows
+
+def _nearest_expiry(instruments, name, inst_type):
+    today = datetime.datetime.now().date()
+    expiries = sorted({i.get("expiry") for i in instruments if i.get("name") == name and i.get("instrument_type") == inst_type and i.get("expiry")})
+    for e in expiries:
+        if hasattr(e, "date"):
+            e_date = e.date()
+        else:
+            e_date = e
+        if e_date >= today:
+            return e_date
+    return expiries[0].date() if expiries else None
+
+def _pick_index_option_contracts(index_name, strikes_each_side=6):
+    instruments = _get_nfo_instruments()
+    if not instruments:
+        return None
+
+    expiry = _nearest_expiry(instruments, index_name, "FUT")
+    opt_expiry = _nearest_expiry(instruments, index_name, "CE") or _nearest_expiry(instruments, index_name, "PE")
+    if not opt_expiry:
+        return None
+
+    fut = None
+    for i in instruments:
+        if i.get("name") == index_name and i.get("instrument_type") == "FUT":
+            e = i.get("expiry")
+            e_date = e.date() if hasattr(e, "date") else e
+            if e_date == expiry:
+                fut = i
+                break
+
+    kite = _get_zerodha_kite()
+    if not kite or not fut:
+        return None
+
+    fut_key = f"NFO:{fut.get('tradingsymbol')}"
+    q = kite.quote([fut_key])
+    fut_ltp = float(q.get(fut_key, {}).get("last_price") or 0)
+    if fut_ltp <= 0:
+        return None
+
+    step = 50 if index_name == "NIFTY" else 100
+    atm = int(round(fut_ltp / step) * step)
+
+    candidates = [i for i in instruments if i.get("name") == index_name and i.get("expiry") and (i.get("instrument_type") in ("CE", "PE"))]
+    out = []
+    for i in candidates:
+        e = i.get("expiry")
+        e_date = e.date() if hasattr(e, "date") else e
+        if e_date != opt_expiry:
+            continue
+        strike = int(i.get("strike") or 0)
+        if strike <= 0:
+            continue
+        if abs(strike - atm) <= (strikes_each_side * step):
+            out.append({
+                "tradingsymbol": i.get("tradingsymbol"),
+                "strike": strike,
+                "opt_type": i.get("instrument_type"),
+                "expiry": str(opt_expiry),
+            })
+
+    return {"index": index_name, "expiry": str(opt_expiry), "atm": atm, "contracts": out, "fut_ltp": fut_ltp}
+
+def _scan_index_options_once(index_name):
+    meta = _pick_index_option_contracts(index_name=index_name)
+    if not meta or not meta.get("contracts"):
+        return {"index": index_name, "signals": [], "top": None, "note": "No option contracts found"}
+
+    kite = _get_zerodha_kite()
+    if not kite:
+        return {"index": index_name, "signals": [], "top": None, "note": "Kite not available"}
+
+    keys = [f"NFO:{c['tradingsymbol']}" for c in meta["contracts"]]
+    quotes = kite.quote(keys)
+
+    now_iso = datetime.datetime.now().isoformat()
+    conn = get_db()
+
+    signals = []
+
+    for c in meta["contracts"]:
+        k = f"NFO:{c['tradingsymbol']}"
+        d = quotes.get(k, {})
+        ltp = float(d.get("last_price") or 0)
+        oi = int(d.get("oi") or 0)
+        vol = int(d.get("volume") or 0)
+        if ltp <= 0 or oi <= 0:
+            continue
+
+        prev = conn.execute(
+            "SELECT ltp, oi, ts FROM option_oi_snapshot WHERE tradingsymbol=? ORDER BY id DESC LIMIT 1",
+            (c["tradingsymbol"],),
+        ).fetchone()
+
+        try:
+            conn.execute(
+                "INSERT INTO option_oi_snapshot (ts, index_name, tradingsymbol, expiry, strike, opt_type, ltp, oi, volume) VALUES (?,?,?,?,?,?,?,?,?)",
+                (now_iso, index_name, c["tradingsymbol"], c["expiry"], c["strike"], c["opt_type"], ltp, oi, vol),
+            )
+        except Exception:
+            pass
+
+        if not prev:
+            continue
+
+        prev_ltp = float(prev["ltp"] or 0)
+        prev_oi = int(prev["oi"] or 0)
+        if prev_ltp <= 0 or prev_oi <= 0:
+            continue
+
+        doi = oi - prev_oi
+        doi_pct = (doi / prev_oi) * 100.0
+        dltp_pct = ((ltp - prev_ltp) / prev_ltp) * 100.0
+
+        if abs(doi_pct) < 12 or abs(dltp_pct) < 4:
+            continue
+
+        if doi_pct > 0 and dltp_pct > 0:
+            signal = "HERO"
+        elif doi_pct > 0 and dltp_pct < 0:
+            signal = "ZERO"
+        else:
+            continue
+
+        side = "BULLISH" if c["opt_type"] == "CE" else "BEARISH"
+        score = round(abs(doi_pct) * 1.4 + abs(dltp_pct) * 3.0 + (math.log(vol + 1) * 2.0), 1)
+        reason = f"ΔOI {doi_pct:.1f}% | ΔP {dltp_pct:.1f}% | Vol {vol}"
+
+        rec = {
+            "ts": now_iso,
+            "index": index_name,
+            "tradingsymbol": c["tradingsymbol"],
+            "expiry": c["expiry"],
+            "strike": c["strike"],
+            "opt_type": c["opt_type"],
+            "ltp": ltp,
+            "oi": oi,
+            "doi": doi,
+            "doi_pct": round(doi_pct, 2),
+            "dltp_pct": round(dltp_pct, 2),
+            "signal": signal,
+            "score": score,
+            "side": side,
+            "action": f"BUY {c['opt_type']}" if signal == "HERO" else "AVOID",
+            "reason": reason,
+        }
+
+        try:
+            conn.execute(
+                "INSERT INTO option_oi_signal (ts,index_name,tradingsymbol,expiry,strike,opt_type,ltp,oi,doi,doi_pct,dltp_pct,signal,score,side,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now_iso, index_name, c["tradingsymbol"], c["expiry"], c["strike"], c["opt_type"], ltp, oi, doi, doi_pct, dltp_pct, signal, score, side, reason),
+            )
+        except Exception:
+            pass
+        signals.append(rec)
+
+    conn.commit()
+    conn.close()
+
+    signals.sort(key=lambda x: x["score"], reverse=True)
+    top = None
+    for s in signals:
+        if s["signal"] == "HERO":
+            top = s
+            break
+    if top is None and signals:
+        top = signals[0]
+
+    # Build summary across CE/PE for momentum direction
+    ce_oi = 0; pe_oi = 0; ce_doi = 0; pe_doi = 0
+    for s in signals:
+        if s["opt_type"] == "CE":
+            ce_oi += int(s.get("oi") or 0)
+            ce_doi += int(s.get("doi") or 0)
+        else:
+            pe_oi += int(s.get("oi") or 0)
+            pe_doi += int(s.get("doi") or 0)
+    oi_imbalance = (ce_oi - pe_oi)
+    doi_imbalance = (ce_doi - pe_doi)
+    direction = "BULLISH" if (oi_imbalance > 0 and doi_imbalance >= 0) or (doi_imbalance > 0) else "BEARISH"
+    summary = {
+        "ce_total_oi": ce_oi, "pe_total_oi": pe_oi,
+        "ce_total_doi": ce_doi, "pe_total_doi": pe_doi,
+        "oi_imbalance": oi_imbalance, "doi_imbalance": doi_imbalance,
+        "momentum": direction
+    }
+
+    return {
+        "index": index_name,
+        "signals": signals[:20],
+        "top": top,
+        "meta": {"expiry": meta["expiry"], "atm": meta["atm"], "fut_ltp": meta["fut_ltp"]},
+        "summary": summary
+    }
+
+def _options_oi_loop():
+    global _options_oi_running, _zerodha_ready
+    interval = 60
+    max_wait = 30
+    while not _zerodha_ready and max_wait > 0:
+        time.sleep(1)
+        max_wait -= 1
+    while _options_oi_running:
+        try:
+            _scan_index_options_once("NIFTY")
+            _scan_index_options_once("BANKNIFTY")
+        except Exception as e:
+            print(f"[OI] Options scanner error: {e}")
+        time.sleep(interval)
 
 def _check_momentum_alerts():
     """Check for sudden momentum changes using cached data."""
@@ -850,6 +1169,7 @@ def _maybe_start_zerodha_ltp_stream(run_in_main_thread=False):
     
     # Start background scanner only after Zerodha is confirmed ready
     _start_background_scanner()
+    _start_options_oi_scanner()
 
     def _worker():
         nonlocal api_key, access_token
@@ -1642,6 +1962,7 @@ def scanner_cached():
         SELECT symbol, company, sector, direction, score, live_price, entry_price, 
                sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, 
                e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
+               index_tag, index_weight,
                ai_prediction, ai_confidence, momentum_score, updated_at
         FROM sector_analysis 
         WHERE 1=1
@@ -1700,8 +2021,9 @@ def scanner_cached():
             "e20": row[18], "e50": row[19], "e200": row[20],
             "supertrend": row[21], "st_dir": row[22],
             "vwap": row[23], "poc": row[24], "va_low": row[25], "va_high": row[26],
-            "ai_target": row[27], "ai_confidence": row[28],
-            "momentum_score": row[29], "updated_at": row[30]
+            "index_tag": row[27], "index_weight": row[28],
+            "ai_target": row[29], "ai_confidence": row[30],
+            "momentum_score": row[31], "updated_at": row[32]
         })
     conn.close()
     
@@ -1988,20 +2310,51 @@ def oi_spikes():
     """Default to cached results for performance."""
     refresh = request.args.get("refresh", "0") == "1"
     if not refresh:
-        # Sort cached analysis by vol_ratio
+        # Sort cached analysis by vol_ratio (lightweight)
         conn = get_db()
         cur = conn.execute("""
-            SELECT symbol, company, sector, live_price, vol_ratio, score, direction, trade_type, adx, rsi, momentum_score
-            FROM sector_analysis 
-            WHERE vol_ratio >= 1.5
-            ORDER BY vol_ratio DESC LIMIT 50
+            SELECT
+                sa.symbol,
+                sa.company,
+                sa.sector,
+                COALESCE(lp.price, sa.live_price, 0) AS live_price,
+                COALESCE(lp.day_change_pct, 0) AS price_change_pct,
+                COALESCE(lp.vol_ratio, sa.vol_ratio, 0) AS vol_ratio,
+                COALESCE(lp.avg_volume, 0) AS avg_volume,
+                sa.score,
+                sa.direction,
+                sa.trade_type,
+                sa.adx,
+                sa.rsi,
+                sa.momentum_score,
+                sa.entry_price AS entry,
+                sa.sl AS sl,
+                sa.risk_per AS risk_per
+            FROM sector_analysis sa
+            LEFT JOIN live_prices lp ON lp.symbol = sa.symbol
+            WHERE COALESCE(lp.vol_ratio, sa.vol_ratio, 0) >= 1.5
+            ORDER BY COALESCE(lp.vol_ratio, sa.vol_ratio, 0) DESC
+            LIMIT 50
         """)
         out = []
         for r in cur.fetchall():
+            spike_type = "NORMAL"
+            if (r["vol_ratio"] or 0) >= 2.0:
+                if (r["price_change_pct"] or 0) > 0:
+                    spike_type = "BUYING"
+                elif (r["price_change_pct"] or 0) < 0:
+                    spike_type = "SELLING"
+                else:
+                    spike_type = "HIGH VOL"
             out.append({
-                "symbol": r[0], "company": r[1], "sector": r[2], "live_price": r[3],
-                "vol_ratio": r[4], "score": r[5], "direction": r[6], "trade_type": r[7],
-                "adx": r[8], "rsi": r[9], "momentum_score": r[10], "is_spike": r[4] >= 2.0
+                "symbol": r["symbol"], "company": r["company"], "sector": r["sector"], "live_price": r["live_price"],
+                "price_change_pct": r["price_change_pct"],
+                "vol_ratio": r["vol_ratio"], "avg_volume": r["avg_volume"],
+                "spike_type": spike_type,
+                "score": r["score"], "direction": r["direction"], "trade_type": r["trade_type"],
+                "adx": r["adx"], "rsi": r["rsi"], "momentum_score": r["momentum_score"],
+                "entry": r["entry"] or 0, "sl": r["sl"] or 0, "risk_per": r["risk_per"] or 0,
+                "is_spike": (r["vol_ratio"] or 0) >= 2.0
             })
         conn.close()
         return jsonify({"spikes": [x for x in out if x["is_spike"]], "all": out, "cached": True})
@@ -2102,6 +2455,204 @@ def oi_spikes():
         "spike_count": len(spikes),
         "ts": datetime.datetime.now().isoformat(),
     })
+
+@app.route("/api/options-hero-zero")
+def options_hero_zero():
+    index_name = request.args.get("index", "NIFTY").upper().strip()
+    if index_name not in ("NIFTY", "BANKNIFTY"):
+        return jsonify({"error": "index must be NIFTY or BANKNIFTY"}), 400
+
+    refresh = request.args.get("refresh", "0") == "1"
+    if refresh:
+        try:
+            out = _scan_index_options_once(index_name)
+            return jsonify(out)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM option_oi_signal WHERE index_name=? ORDER BY id DESC LIMIT 200",
+        (index_name,),
+    ).fetchall()
+    # Build CE/PE summary from cached signals
+    ce_oi = 0; pe_oi = 0; ce_doi = 0; pe_doi = 0
+    for r in rows:
+        if (r["opt_type"] or "") == "CE":
+            ce_oi += int(r["oi"] or 0); ce_doi += int(r["doi"] or 0)
+        else:
+            pe_oi += int(r["oi"] or 0); pe_doi += int(r["doi"] or 0)
+    summary = {
+        "ce_total_oi": ce_oi, "pe_total_oi": pe_oi,
+        "ce_total_doi": ce_doi, "pe_total_doi": pe_doi,
+        "oi_imbalance": ce_oi - pe_oi, "doi_imbalance": ce_doi - pe_doi,
+        "momentum": "BULLISH" if (ce_doi - pe_doi) > 0 else "BEARISH"
+    }
+    conn.close()
+
+    signals = [dict(r) for r in rows]
+    signals.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+    top = None
+    for s in signals:
+        if s.get("signal") == "HERO":
+            top = s
+            break
+    if top is None and signals:
+        top = signals[0]
+
+    return jsonify({"index": index_name, "top": top, "signals": signals[:20], "summary": summary, "cached": True, "ts": datetime.datetime.now().isoformat()})
+
+# ── WhatsApp Alerts (CallMeBot) ─────────────────────────────
+def _load_whatsapp_config():
+    cfg_path = os.path.join(BASE, "../data/whatsapp.json")
+    default_cfg = {
+        "send_on": {"alerts": True, "signals": True, "options": True},
+        "thresholds": {"signal_min_score": 8, "alert_min_score": 7},
+        "recipients": []
+    }
+    if not os.path.exists(cfg_path):
+        return default_cfg
+    try:
+        with open(cfg_path) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            default_cfg["recipients"] = data
+            return default_cfg
+        if isinstance(data, dict):
+            cfg = default_cfg
+            cfg.update({k: v for k, v in data.items() if k in ("send_on", "thresholds", "recipients")})
+            if not isinstance(cfg.get("recipients"), list):
+                cfg["recipients"] = []
+            if not isinstance(cfg.get("send_on"), dict):
+                cfg["send_on"] = default_cfg["send_on"]
+            if not isinstance(cfg.get("thresholds"), dict):
+                cfg["thresholds"] = default_cfg["thresholds"]
+            return cfg
+    except Exception:
+        pass
+    return default_cfg
+
+def _send_whatsapp_callmebot(phone, apikey, text):
+    try:
+        import urllib.parse, urllib.request
+        q = urllib.parse.urlencode({"phone": phone, "text": text, "apikey": apikey})
+        url = f"https://api.callmebot.com/whatsapp.php?{q}"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            _ = resp.read()
+        return True
+    except Exception as e:
+        p = str(phone)
+        masked = (p[:3] + "****" + p[-3:]) if len(p) >= 8 else "****"
+        print(f"[WHATSAPP] Failed for {masked}: {e}")
+        return False
+
+def _enqueue_whatsapp(kind, event_key, message):
+    with _whatsapp_event_lock:
+        if event_key in _whatsapp_event_cache:
+            return
+        _whatsapp_event_cache[event_key] = time.time()
+    def _worker():
+        cfg = _load_whatsapp_config()
+        targets = cfg.get("recipients") or []
+        sent = 0
+        for t in targets:
+            if isinstance(t, dict) and t.get("enabled", True) is False:
+                continue
+            phone = str((t.get("phone") if isinstance(t, dict) else "") or "").strip()
+            apikey = str((t.get("apikey") if isinstance(t, dict) else "") or "").strip()
+            kinds = (t.get("kinds") if isinstance(t, dict) else None)
+            if kinds and isinstance(kinds, list) and kind not in kinds:
+                continue
+            if not phone or not apikey:
+                continue
+            if _send_whatsapp_callmebot(phone, apikey, message):
+                sent += 1
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _maybe_send_whatsapp_signal(signal_data):
+    cfg = _load_whatsapp_config()
+    if not cfg.get("send_on", {}).get("signals", True):
+        return
+    thr = int(cfg.get("thresholds", {}).get("signal_min_score", 8))
+    score = float(signal_data.get("score") or 0)
+    adx = float(signal_data.get("adx") or 0)
+    vr = float(signal_data.get("vol_ratio") or 0)
+    if score < thr:
+        return
+    if adx < 25 or vr < 1.2:
+        return
+    event_key = f"signal:{signal_data.get('date')}:{signal_data.get('symbol')}:{signal_data.get('trade_type','SWING')}"
+    msg = (
+        f"HIGH ACCURACY SIGNAL: {signal_data.get('symbol')} | {signal_data.get('direction')} | "
+        f"Score {score}/9 | ADX {adx:.1f} | Vol {vr:.2f}x | "
+        f"Entry ₹{signal_data.get('entry')} | SL ₹{signal_data.get('sl')} | T1 ₹{signal_data.get('t1')} | T2 ₹{signal_data.get('t2')}"
+    )
+    _enqueue_whatsapp("signals", event_key, msg)
+
+def _maybe_send_whatsapp_alert(alert_data, alert_id):
+    cfg = _load_whatsapp_config()
+    if not cfg.get("send_on", {}).get("alerts", True):
+        return
+    thr = int(cfg.get("thresholds", {}).get("alert_min_score", 7))
+    score = float(alert_data.get("score") or 0)
+    if score < thr:
+        return
+    event_key = f"alert:{alert_id}"
+    msg = (
+        f"ALERT: {alert_data.get('symbol')} | {alert_data.get('alert_type')} | {alert_data.get('direction')} | "
+        f"Price ₹{alert_data.get('price')} | Chg {alert_data.get('change_pct')}% | Vol {alert_data.get('vol_ratio')}x | "
+        f"Score {score}/9 | Entry ₹{alert_data.get('entry_price')} | SL ₹{alert_data.get('sl')} | T1 ₹{alert_data.get('t1')}"
+    )
+    _enqueue_whatsapp("alerts", event_key, msg)
+
+@app.route("/api/whatsapp/send")
+def whatsapp_send():
+    index_name = request.args.get("index", "NIFTY").upper().strip()
+    # Use latest hero-zero cached signals
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM option_oi_signal WHERE index_name=? ORDER BY id DESC LIMIT 10", (index_name,)
+    ).fetchall()
+    conn.close()
+    signals = [dict(r) for r in rows if (r.get("signal") == "HERO")]
+    if not signals:
+        return jsonify({"ok": False, "error": "No HERO signals"}), 400
+    top = sorted(signals, key=lambda x: float(x.get("score") or 0), reverse=True)[0]
+    msg = f"{index_name} HERO: BUY {top.get('opt_type')} {top.get('tradingsymbol')} | LTP ₹{top.get('ltp')} | ΔOI {top.get('doi_pct')}% | ΔP {top.get('dltp_pct')}% | Exp {top.get('expiry')} | Score {top.get('score')}"
+    _enqueue_whatsapp("options", f"options:{index_name}:{top.get('tradingsymbol')}:{top.get('ts')}", msg)
+    return jsonify({"ok": True, "queued": True, "message": msg})
+
+@app.route("/api/whatsapp/test")
+def whatsapp_test():
+    kind = request.args.get("kind", "alerts").strip().lower()
+    if kind not in ("alerts", "signals", "options"):
+        return jsonify({"error": "kind must be alerts/signals/options"}), 400
+    msg = request.args.get("text", "Test message from Trade Smart v7").strip()
+    event_key = f"test:{kind}:{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+    _enqueue_whatsapp(kind, event_key, msg)
+    return jsonify({"ok": True, "queued": True, "event_key": event_key})
+
+@app.route("/api/whatsapp/config", methods=["GET", "POST"])
+def whatsapp_config():
+    cfg_path = os.path.join(BASE, "../data/whatsapp.json")
+    if request.method == "GET":
+        cfg = _load_whatsapp_config()
+        return jsonify(cfg)
+
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"error": "Config must be a JSON object"}), 400
+
+    if "recipients" in data and not isinstance(data["recipients"], list):
+        return jsonify({"error": "recipients must be a list"}), 400
+
+    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(data, f, indent=2)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/alerts")
 def get_alerts():
