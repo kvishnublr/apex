@@ -4095,13 +4095,13 @@ function showSignalDetail(sym) {
 var signalData = [];
 
 async function loadSignals(highlightSym) {
-  var min = parseInt(document.getElementById('sig-min').value) || 7;
+  var min = parseInt(document.getElementById('sig-min').value) || 8;
   var type = document.getElementById('sig-type') ? document.getElementById('sig-type').value : '';
   
   document.getElementById('signals-grid').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
   
-  // Get signals from DB
-  var quality = min >= 9 ? 'elite' : min >= 8 ? 'high' : 'prime';
+  // Get signals from DB - use elite for high confidence
+  var quality = min >= 8 ? 'elite' : min >= 7 ? 'high' : 'prime';
   if (highlightSym) quality = 'all';
   var scanner = await api('/scanner-cached?quality=' + quality + '&min_score=' + min + (type ? '&type=' + type : ''));
   
@@ -4119,12 +4119,10 @@ async function loadSignals(highlightSym) {
   // Additional refinement for Signals page (avoid chasing moves)
   if (!highlightSym) {
     signalData = signalData.filter(function(s) {
-      if (!s || !s.entry || !s.live_price) return false;
-      if (s.ai_confidence !== undefined && s.ai_confidence < 60) return false;
-      if (s.vol_ratio !== undefined && s.vol_ratio < 1.1) return false;
-      if (s.adx !== undefined && s.adx < 20) return false;
-      var diff = Math.abs((s.live_price - s.entry) / s.entry);
-      return diff <= 0.012;
+      if (!s || !s.entry_price || !s.live_price) return false;
+      if (s.vol_ratio !== undefined && s.vol_ratio < 0.8) return false;
+      if (s.adx !== undefined && s.adx < 15) return false;
+      return true;
     });
   }
   
@@ -4191,23 +4189,31 @@ async function refreshLivePrices() {
 function renderSignals() {
   document.getElementById('signals-grid').innerHTML = signalData.map(function(s) {
     var dirClass = s.direction === 'LONG' ? 'long' : 'short';
-    var scoreClass = s.score >= 8 ? 'score-high' : s.score >= 7 ? 'score-mid' : 'score-low';
+    var scoreClass = (s.score || 0) >= 8 ? 'score-high' : (s.score || 0) >= 7 ? 'score-mid' : 'score-low';
     var price = s.live_price || s.current || 0;
-    var entryDiff = price - s.entry;
+    var entry = s.entry || s.entry_price || 0;
+    var sl = s.sl || 0;
+    var t1 = s.t1 || 0;
+    var t2 = s.t2 || 0;
+    var riskPer = s.risk_per || 0;
+    var entryDiff = price - entry;
     var riskPct = s.risk_pct || 0;
-    var rr = s.t1 && s.sl ? Math.abs((s.t1 - s.entry) / (s.sl - s.entry)).toFixed(1) : '--';
+    var rr = t1 && sl ? Math.abs((t1 - entry) / (sl - entry)).toFixed(1) : '--';
     var typeLabel = (s.recommended || 'SWING');
     var typeClass = typeLabel === 'SWING' ? 'type-swing' : 'type-intra';
     var volRatio = s.vol_ratio || 1;
     var volClass = volRatio >= 2 ? 'var(--warning-dark)' : volRatio >= 1.5 ? 'var(--info)' : 'var(--text-muted)';
     var chg = s.day_change_pct || 0;
     var chgColor = chg >= 0 ? 'var(--success)' : 'var(--danger)';
+    var entryTime = s.entry_time || s.signal_time || '';
+    var isGuaranteed = (s.score || 0) >= 8.5 && ((s.ai_confidence || 0) >= 70 || (s.vol_ratio || 0) >= 1.5);
+    var guaranteedTag = isGuaranteed ? '<span style="background:linear-gradient(135deg,#f59e0b,#dc2626);color:white;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;margin-right:6px;">★ GUARANTEED</span>' : '';
 
-    return '<div class="signal-card ' + dirClass + '" style="margin-bottom:20px;">' +
+    return '<div class="signal-card ' + dirClass + '" onclick="showStockDetail(\'' + s.symbol + '\')" style="margin-bottom:20px;cursor:pointer">' +
       '<div class="signal-header">' +
         '<div>' +
-          '<div class="signal-symbol ' + dirClass + '">' + s.symbol + '</div>' +
-          '<div class="signal-company">' + s.company + ' · ' + s.sector + '</div>' +
+          '<div class="signal-symbol ' + dirClass + '">' + guaranteedTag + s.symbol + '</div>' +
+          '<div class="signal-company">' + (s.company || s.symbol) + ' · ' + (s.sector || '') + (entryTime ? ' · ⏰ ' + entryTime : '') + '</div>' +
         '</div>' +
         '<div style="display:flex;gap:8px;align-items:center;">' +
           '<span class="badge ' + typeClass + '">' + typeLabel + '</span>' +
@@ -4223,23 +4229,23 @@ function renderSignals() {
         '<div style="text-align:center;font-size:20px;color:var(--text-muted);">→</div>' +
         '<div style="text-align:center;flex:1;">' +
           '<div class="signal-entry-label">Entry Price</div>' +
-          '<div class="signal-entry-value entry">₹' + s.entry.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div>' +
+          '<div class="signal-entry-value entry">₹' + entry.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div>' +
           '<div style="font-size:10px;color:var(--text-muted);font-family:JetBrains Mono;">' + (entryDiff > 0 ? '↓ Below by ₹' : entryDiff < 0 ? '↑ Above by ₹' : 'At market') + Math.abs(entryDiff).toFixed(2) + '</div>' +
         '</div>' +
       '</div>' +
 
       '<div class="signal-levels-grid">' +
-        '<div class="signal-level-box"><div class="signal-level-label">Stop Loss</div><div class="signal-level-value" style="color:var(--danger);">₹' + s.sl.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div></div>' +
-        '<div class="signal-level-box t1"><div class="signal-level-label">Target 1</div><div class="signal-level-value">₹' + s.t1.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div></div>' +
-        '<div class="signal-level-box t2"><div class="signal-level-label">Target 2</div><div class="signal-level-value">₹' + s.t2.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div></div>' +
-        '<div class="signal-level-box"><div class="signal-level-label">Risk ₹</div><div class="signal-level-value" style="color:var(--danger);">₹' + s.risk_per.toLocaleString('en-IN', {minimumFractionDigits: 1}) + '</div></div>' +
+        '<div class="signal-level-box"><div class="signal-level-label">Stop Loss</div><div class="signal-level-value" style="color:var(--danger);">₹' + sl.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div></div>' +
+        '<div class="signal-level-box t1"><div class="signal-level-label">Target 1</div><div class="signal-level-value">₹' + t1.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div></div>' +
+        '<div class="signal-level-box t2"><div class="signal-level-label">Target 2</div><div class="signal-level-value">₹' + t2.toLocaleString('en-IN', {minimumFractionDigits: 2}) + '</div></div>' +
+        '<div class="signal-level-box"><div class="signal-level-label">Risk ₹</div><div class="signal-level-value" style="color:var(--danger);">₹' + riskPer.toLocaleString('en-IN', {minimumFractionDigits: 1}) + '</div></div>' +
         '<div class="signal-level-box"><div class="signal-level-label">Day Chg</div><div class="signal-level-value" style="color:' + chgColor + ';">' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</div></div>' +
       '</div>' +
 
       '<div class="signal-indicators">' +
-        '<div class="signal-ind-bar adx"><div class="signal-ind-label">ADX</div><div class="signal-ind-value">' + s.adx.toFixed(1) + '</div></div>' +
-        '<div class="signal-ind-bar rsi"><div class="signal-ind-label">RSI</div><div class="signal-ind-value">' + s.rsi.toFixed(1) + '</div></div>' +
-        '<div class="signal-ind-bar score"><div class="signal-ind-label">Score</div><div class="signal-ind-value">' + s.score + '/9</div></div>' +
+        '<div class="signal-ind-bar adx"><div class="signal-ind-label">ADX</div><div class="signal-ind-value">' + (s.adx || 0).toFixed(1) + '</div></div>' +
+        '<div class="signal-ind-bar rsi"><div class="signal-ind-label">RSI</div><div class="signal-ind-value">' + (s.rsi || 0).toFixed(1) + '</div></div>' +
+        '<div class="signal-ind-bar score"><div class="signal-ind-label">Score</div><div class="signal-ind-value">' + (s.score || 0) + '/9</div></div>' +
         '<div class="signal-ind-bar risk"><div class="signal-ind-label">Risk %</div><div class="signal-ind-value">' + riskPct + '%</div></div>' +
         '<div class="signal-ind-bar"><div class="signal-ind-label">Vol Ratio</div><div class="signal-ind-value" style="color:' + volClass + ';">' + volRatio.toFixed(1) + 'x</div></div>' +
       '</div>' +
@@ -4425,10 +4431,13 @@ async function loadSwingTrades() {
     var adx = s.adx || 0;
     var rsi = s.rsi || 0;
     var risk = s.risk_pct || 0;
+    var entryTime = s.entry_time || '';
+    var isGuaranteed = score >= 8.5 && (s.ai_confidence >= 70 || s.vol_ratio >= 1.5);
+    var guaranteedTag = isGuaranteed ? '<span style="background:linear-gradient(135deg,#f59e0b,#dc2626);color:white;padding:2px 6px;border-radius:4px;font-size:9px;font-weight:700;margin-right:4px;">★</span>' : '';
     
-    return '<div class="signal-card ' + dirClass + '">' +
+    return '<div class="signal-card ' + dirClass + '" onclick="showStockDetail(\'' + s.symbol + '\')" style="cursor:pointer">' +
       '<div class="signal-header">' +
-        '<div><div class="signal-symbol ' + dirClass + '">' + s.symbol + '</div>' +
+        '<div><div class="signal-symbol ' + dirClass + '">' + guaranteedTag + s.symbol + (entryTime ? ' <span style="font-size:10px;color:var(--text-muted)">⏰' + entryTime + '</span>' : '') + '</div>' +
         '<div class="signal-company">' + (s.company || '') + '</div></div>' +
         '<div class="signal-direction ' + dirClass + '">' + s.direction + '</div>' +
       '</div>' +
@@ -4469,9 +4478,12 @@ async function loadIntraday() {
     document.getElementById('intraday-grid').innerHTML = allIntra.slice(0, 6).map(function(s) {
       var dirClass = s.direction === 'LONG' ? 'long' : 'short';
       var price = s.live_price || s.current || 0;
-      return '<div class="signal-card ' + dirClass + '">' +
+      var entryTime = s.entry_time || '';
+      var isGuaranteed = (s.score || 0) >= 8.5 && (s.ai_confidence >= 70 || s.vol_ratio >= 1.5);
+      var guaranteedTag = isGuaranteed ? '<span style="background:linear-gradient(135deg,#f59e0b,#dc2626);color:white;padding:2px 6px;border-radius:4px;font-size:9px;font-weight:700;margin-right:4px;">★</span>' : '';
+      return '<div class="signal-card ' + dirClass + '" onclick="showStockDetail(\'' + s.symbol + '\')" style="cursor:pointer">' +
         '<div class="signal-header">' +
-          '<div><div class="signal-symbol ' + dirClass + '">' + s.symbol + '</div>' +
+          '<div><div class="signal-symbol ' + dirClass + '">' + guaranteedTag + s.symbol + (entryTime ? ' <span style="font-size:10px;color:var(--text-muted)">⏰' + entryTime + '</span>' : '') + '</div>' +
           '<div class="signal-company">' + (s.company || '') + '</div></div>' +
           '<div class="signal-direction ' + dirClass + '">' + s.direction + '</div>' +
         '</div>' +

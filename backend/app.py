@@ -19,7 +19,9 @@ from engine import (
 
 app  = Flask(__name__)
 BASE = os.path.dirname(os.path.abspath(__file__))
-DB   = os.path.join(BASE, "../data/trades.db")
+import datetime
+DB_NAME = f"trades_{datetime.datetime.now().strftime('%Y%m%d')}.db"
+DB   = os.path.join(BASE, "../data/", DB_NAME)
 CFG  = os.path.join(BASE, "../data/config.json")
 
 _cache = {}   # sym -> (rows, inds)
@@ -40,6 +42,21 @@ def get_db():
 def init_db():
     """Initialize SQLite database and ensure all columns exist."""
     conn = get_db()
+    
+    # Clear all existing data for fresh start
+    try:
+        conn.execute("DELETE FROM signal_log")
+        conn.execute("DELETE FROM trades")
+        conn.execute("DELETE FROM sector_analysis")
+        conn.execute("DELETE FROM live_prices")
+        conn.execute("DELETE FROM momentum_alerts")
+        conn.execute("DELETE FROM ai_predictions")
+        conn.execute("DELETE FROM price_cache")
+        conn.commit()
+        print("[DB] Cleared all tables for fresh start")
+    except Exception as e:
+        print(f"[DB] Clear warning: {e}")
+    
     # Base tables
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS trades (
@@ -428,10 +445,11 @@ def log_signal(signal_data):
     """Store a signal in the log with detailed entry info."""
     try:
         conn = get_db()
+        signal_time = signal_data.get("signal_time", datetime.datetime.now().strftime("%H:%M"))
         conn.execute("""
             INSERT INTO signal_log (signal_date, symbol, sector, direction, score, trade_type,
-                entry, sl, t1, t2, t3, adx, rsi, vol_ratio, filters, entry_time, atr, live_price, risk_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entry, sl, t1, t2, t3, adx, rsi, vol_ratio, filters, entry_time, atr, live_price, risk_pct, signal_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(signal_date, symbol, trade_type) DO UPDATE SET
                 sector=excluded.sector,
                 direction=excluded.direction,
@@ -449,6 +467,7 @@ def log_signal(signal_data):
                 atr=excluded.atr,
                 live_price=excluded.live_price,
                 risk_pct=excluded.risk_pct,
+                signal_time=excluded.signal_time,
                 logged_at=CURRENT_TIMESTAMP
         """, (signal_data["date"], signal_data["symbol"], signal_data["sector"],
               signal_data["direction"], signal_data["score"], signal_data.get("trade_type", "SWING"),
@@ -456,10 +475,10 @@ def log_signal(signal_data):
               signal_data["adx"], signal_data["rsi"], signal_data["vol_ratio"],
               json.dumps(signal_data["filters"]), signal_data.get("entry_time", "09:20"),
               signal_data.get("atr", 0), signal_data.get("live_price", 0),
-              signal_data.get("risk_pct", 0)))
+              signal_data.get("risk_pct", 0), signal_time))
         conn.commit()
         conn.close()
-        print(f"[DB] Logged {signal_data.get('trade_type')} signal: {signal_data['symbol']}")
+        print(f"[DB] Logged {signal_data.get('trade_type')} signal: {signal_data['symbol']} at {signal_time}")
         try:
             _maybe_send_whatsapp_signal(signal_data)
         except Exception as e:
@@ -581,6 +600,82 @@ def _generate_ai_predictions():
     except Exception as e:
         pass
 
+def _check_signal_targets():
+    """Check all signals and update if targets or SL hit."""
+    try:
+        conn = get_db()
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        now = datetime.datetime.now().strftime("%H:%M")
+        
+        # Get all pending signals
+        signals = conn.execute("""
+            SELECT id, symbol, direction, entry, sl, t1, t2, result
+            FROM signal_log 
+            WHERE signal_date = ? AND (result IS NULL OR result = 'PENDING')
+        """, (today,)).fetchall()
+        
+        if not signals:
+            return
+        
+        # Get live prices
+        live_prices = {p['symbol']: p['price'] for p in get_all_live_prices_db()}
+        
+        updated = 0
+        for sig in signals:
+            sig_id, sym, direction, entry, sl, t1, t2, result = sig
+            if sym not in live_prices:
+                continue
+            
+            lp = live_prices[sym]
+            if not lp or lp <= 0:
+                continue
+            
+            hit_result = None
+            t1_hit = None
+            t2_hit = None
+            sl_hit = None
+            
+            if direction == 'LONG':
+                if lp >= t1:
+                    hit_result = 'T1_HIT'
+                    t1_hit = now
+                elif lp >= t2:
+                    hit_result = 'T2_HIT'
+                    t2_hit = now
+                elif lp <= sl:
+                    hit_result = 'SL_HIT'
+                    sl_hit = now
+            else:  # SHORT
+                if lp <= t1:
+                    hit_result = 'T1_HIT'
+                    t1_hit = now
+                elif lp <= t2:
+                    hit_result = 'T2_HIT'
+                    t2_hit = now
+                elif lp >= sl:
+                    hit_result = 'SL_HIT'
+                    sl_hit = now
+            
+            if hit_result:
+                conn.execute("""
+                    UPDATE signal_log SET 
+                        result = ?,
+                        t1_hit_time = COALESCE(?, t1_hit_time),
+                        t2_hit_time = COALESCE(?, t2_hit_time),
+                        sl_hit_time = COALESCE(?, sl_hit_time),
+                        status = ?
+                    WHERE id = ?
+                """, (hit_result, t1_hit, t2_hit, sl_hit, hit_result, sig_id))
+                updated += 1
+        
+        if updated > 0:
+            conn.commit()
+            print(f"[SIGNAL-TRACK] Updated {updated} signals")
+        
+        conn.close()
+    except Exception as e:
+        print(f"[SIGNAL-TRACK] Error: {e}")
+
 def _start_background_scanner():
     """Start the background scanner thread."""
     global _scanner_running
@@ -628,6 +723,9 @@ def _background_scanner_loop():
             # Every cycle, check for momentum alerts using cached data
             _check_momentum_alerts()
             
+            # Check signal status (targets hit or stop loss)
+            _check_signal_targets()
+            
         except Exception as e:
             print(f"[BG-SCAN] Error: {e}")
         
@@ -639,7 +737,9 @@ def _full_universe_scan():
     cfg = gcfg()
     use_real = cfg.get("use_real", True)
     
-    # Use the global get_zerodha_live_prices function
+    # Get detailed quotes from Zerodha (includes prev_close, change, etc.)
+    quote_data = get_zerodha_quotes([u[0] for u in UNIVERSE])
+    # Also get simple LTP for fallback
     live_prices = get_zerodha_live_prices([u[0] for u in UNIVERSE])
     
     _ml_data_cache = {}
@@ -663,11 +763,16 @@ def _full_universe_scan():
             upsert_price(sym, last["date"], last["open"], last["high"],
                         last["low"], last["close"], last["volume"], ind)
             
-            # Cache live price
-            lp = live_prices.get(sym, last["close"])
+            # Get live price and prev_close from Zerodha quote data
+            qd = quote_data.get(sym, {})
+            lp = qd.get("price") or live_prices.get(sym) or last["close"]
+            prev_close = qd.get("prev_close") or last["close"]
+            day_chg = qd.get("change_pct", 0)
+            volume = qd.get("volume") or last["volume"]
+            
             vol_window = [r["volume"] for r in rows[-21:-1]] if len(rows) >= 21 else [r["volume"] for r in rows[:-1]]
             avg_vol = sum(vol_window) / len(vol_window) if vol_window else 1
-            update_live_price(sym, lp, last["close"], last["volume"], avg_vol)
+            update_live_price(sym, lp, prev_close, volume, avg_vol)
             
             # Score and log signal (Accuracy focus: Score >= 7)
             sc, direction, fl, meta = score_candle(last, ind, rows)
@@ -676,6 +781,7 @@ def _full_universe_scan():
                 lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
                 risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
                 
+                current_time = datetime.datetime.now().strftime("%H:%M")
                 signal_data = {
                     "date": last["date"], "symbol": sym, "sector": info[3],
                     "direction": direction, "score": sc,
@@ -685,7 +791,8 @@ def _full_universe_scan():
                     "adx": meta.get("adx", 0), "rsi": meta.get("rsi", 50),
                     "vol_ratio": meta.get("vr", 1),
                     "filters": fl,
-                    "entry_time": "09:20",
+                    "entry_time": current_time,
+                    "signal_time": current_time,
                     "atr": ind.get("atr", 0),
                     "live_price": lp,
                     "risk_pct": risk_pct,
@@ -704,8 +811,9 @@ def _full_universe_scan():
             if not info:
                 continue
             
-            # Get live price
-            lp = live_prices.get(sym, 0)
+            # Get live price from quote data (has prev_close, change_pct, etc.)
+            qd = quote_data.get(sym, {})
+            lp = qd.get("price") or live_prices.get(sym, 0)
             if lp <= 0:
                 continue
             
@@ -716,13 +824,21 @@ def _full_universe_scan():
             last = rows[-1]
             ind = compute_indicators(rows)[-1]
             
-            sc, direction, fl, meta = score_candle(last, ind, rows)
-            trade_type = meta.get("trend_quality", "SWING")
+            # Update meta with day_change_pct from Zerodha
+            meta_copy = dict(meta)
+            if qd.get("change_pct") is not None:
+                meta_copy["day_change_pct"] = qd["change_pct"]
+            
+            sc, direction, fl, meta_out = score_candle(last, ind, rows)
+            # Preserve day_change_pct
+            if qd.get("change_pct") is not None:
+                meta_out["day_change_pct"] = qd["change_pct"]
+            trade_type = meta_out.get("trend_quality", "SWING")
             lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
             risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
             
             # Store analysis for sector views
-            _store_sector_analysis(info, sym, direction, sc, lv, lp, risk_pct, trade_type, meta, ind)
+            _store_sector_analysis(info, sym, direction, sc, lv, lp, risk_pct, trade_type, meta_out, ind)
         except:
             continue
     
@@ -1479,15 +1595,15 @@ def get_intra_signals():
     """Get high-accuracy intraday signals from DB."""
     conn = get_db()
     signals = [dict(r) for r in conn.execute(
-        "SELECT * FROM signal_log WHERE trade_type = 'INTRA' AND score >= 7 ORDER BY logged_at DESC LIMIT 50"
+        "SELECT * FROM signal_log WHERE trade_type = 'INTRA' AND score >= 8 ORDER BY logged_at DESC LIMIT 20"
     ).fetchall()]
     
     current = [dict(r) for r in conn.execute("""
         SELECT symbol, company, sector, direction, score, live_price, entry_price as entry, 
-               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type as recommended
+               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type as recommended, entry_time, ai_confidence
         FROM sector_analysis 
-        WHERE trade_type = 'INTRA' AND score >= 7
-        ORDER BY score DESC, momentum_score DESC
+        WHERE trade_type = 'INTRA' AND score >= 8 AND adx >= 18
+        ORDER BY score DESC, ai_confidence DESC
     """).fetchall()]
     
     conn.close()
@@ -1499,15 +1615,15 @@ def get_swing_signals():
     conn = get_db()
     # Return both signal_log history and current scanner analysis for swing
     signals = [dict(r) for r in conn.execute(
-        "SELECT * FROM signal_log WHERE trade_type = 'SWING' AND score >= 7 ORDER BY logged_at DESC LIMIT 50"
+        "SELECT * FROM signal_log WHERE trade_type = 'SWING' AND score >= 8 ORDER BY logged_at DESC LIMIT 30"
     ).fetchall()]
     
     current = [dict(r) for r in conn.execute("""
         SELECT symbol, company, sector, direction, score, live_price, entry_price as entry, 
-               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type as recommended
+               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type as recommended, entry_time, ai_confidence
         FROM sector_analysis 
-        WHERE trade_type = 'SWING' AND score >= 7
-        ORDER BY score DESC, momentum_score DESC
+        WHERE trade_type = 'SWING' AND score >= 8 AND adx >= 20 AND direction = 'LONG'
+        ORDER BY score DESC, ai_confidence DESC
     """).fetchall()]
     
     conn.close()
@@ -1518,11 +1634,11 @@ def sector_intelligence():
     """Get all stocks analyzed and ranked by AI probability score across all sectors."""
     conn = get_db()
     cur = conn.execute("""
-        SELECT symbol, company, sector, direction, score, live_price, entry_price, sl, t1, t2,
-               adx, rsi, vol_ratio, risk_pct, trade_type, ai_prediction, ai_confidence, 
-               momentum_score, updated_at, atr, risk_per
+        SELECT symbol, company, sector, direction, score, live_price, entry_price, sl, t1, t2, t3,
+               adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, ai_prediction, ai_confidence, 
+               momentum_score, updated_at
         FROM sector_analysis 
-        ORDER BY (ai_confidence * 0.5 + score * 11.1 * 0.3 + momentum_score * 0.2) DESC
+        ORDER BY score DESC, ai_confidence DESC
     """)
     
     stocks = []
@@ -1530,13 +1646,11 @@ def sector_intelligence():
         s = {
             "symbol": row[0], "company": row[1], "sector": row[2], "direction": row[3],
             "score": row[4], "live_price": row[5], "entry_price": row[6], "sl": row[7],
-            "t1": row[8], "t2": row[9], "adx": row[10], "rsi": row[11],
-            "vol_ratio": row[12], "risk_pct": row[13], "trade_type": row[14],
-            "ai_target": row[15], "ai_confidence": row[16], "momentum_score": row[17],
-            "updated_at": row[18], "atr": row[19], "risk_per": row[20]
+            "t1": row[8], "t2": row[9], "t3": row[10], "adx": row[11], "rsi": row[12],
+            "vol_ratio": row[13], "risk_pct": row[14], "risk_per": row[15], "atr": row[16],
+            "trade_type": row[17], "ai_prediction": row[18], "ai_confidence": row[19],
+            "momentum_score": row[20], "updated_at": row[21]
         }
-        # Calculate a unified probability score for the UI
-        s["prob_score"] = round((s["ai_confidence"] * 0.5) + (s["score"] * 11.1 * 0.3) + (s["momentum_score"] * 0.2), 1)
         stocks.append(s)
     
     conn.close()
@@ -1880,6 +1994,7 @@ def get_zerodha_live_prices(symbols, retries=3):
     """
     Robust Zerodha LTP fetcher with retry + exponential backoff.
     Falls back to DB cache if Zerodha fails.
+    Returns: dict of symbol -> price (live price)
     """
     api_key = os.environ.get("KITE_API_KEY", "").strip()
     access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
@@ -1946,51 +2061,174 @@ def _get_from_db_cache(symbols):
     print(f"[CACHE] Got {len(result)} prices from DB cache")
     return result
 
+def get_zerodha_quotes(symbols):
+    """
+    Get detailed quote data from Zerodha including prev_close, change, etc.
+    Returns: dict of symbol -> {price, prev_close, change_pct, volume, ...}
+    """
+    api_key = os.environ.get("KITE_API_KEY", "").strip()
+    access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
+    
+    if not api_key or not access_token:
+        return {}
+    
+    try:
+        kite = _get_zerodha_kite()
+        if not kite:
+            return {}
+        
+        instruments = kite.instruments("NSE")
+        inst_map = {i["tradingsymbol"]: i["instrument_token"] for i in instruments}
+        
+        # Build token keys in NSE:SYMBOL format for quote API
+        quote_keys = []
+        sym_map = {}
+        for sym in symbols:
+            for cand in [sym, sym.replace("&", "%26")]:
+                if cand in inst_map:
+                    quote_keys.append(f"NSE:{cand}")
+                    sym_map[f"NSE:{cand}"] = cand
+                    break
+        
+        if not quote_keys:
+            return {}
+        
+        quote_data = kite.quote(quote_keys)
+        result = {}
+        for key, data in quote_data.items():
+            sym = sym_map.get(key)
+            if not sym:
+                continue
+            
+            last_price = data.get("last_price", 0)
+            ohlc = data.get("ohlc", {})
+            prev_close = ohlc.get("close", 0) if ohlc else 0
+            change_pct = data.get("net_change", 0)
+            volume = data.get("volume", 0) or data.get("total_volume", 0)
+            
+            if last_price and last_price > 0:
+                # Calculate change_pct from prev_close
+                if prev_close and prev_close > 0:
+                    change_pct = round((last_price - prev_close) / prev_close * 100, 2)
+                
+                result[sym] = {
+                    "price": round(float(last_price), 2),
+                    "prev_close": round(float(prev_close), 2) if prev_close else 0,
+                    "change_pct": change_pct,
+                    "volume": int(volume) if volume else 0
+                }
+        
+        print(f"[ZERODHA QUOTE] Got detailed quotes for {len(result)} symbols")
+        return result
+        
+    except Exception as e:
+        print(f"[ZERODHA QUOTE] Error: {e}")
+        return {}
+
+@app.route("/api/scanner-fresh")
+def scanner_fresh():
+    """Fresh scanner with real-time prices"""
+    try:
+        ms = int(request.args.get("min_score", 0))
+        
+        # Get fresh prices from DB
+        live_prices_list = get_all_live_prices_db()
+        fresh_prices = {p['symbol']: p['price'] for p in live_prices_list if p.get('price')}
+        
+        from engine import compute_levels
+        
+        conn = get_db()
+        
+        query = """
+            SELECT symbol, company, sector, direction, score, live_price, entry_price, 
+                   sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type
+            FROM sector_analysis 
+            WHERE score >= ?
+            ORDER BY score DESC
+        """
+        
+        cur = conn.execute(query, (ms,))
+        out = []
+        for row in cur.fetchall():
+            sym = row[0]
+            direction = row[3]
+            trade_type = row[17] or "SWING"
+            
+            current_price = fresh_prices.get(sym) or row[5]
+            
+            if current_price and current_price > 0:
+                atr = current_price * 0.015
+                levels = compute_levels(current_price, atr, direction, trade_type)
+                entry = levels["entry"]
+                sl = levels["sl"]
+                t1 = levels["t1"]
+                t2 = levels["t2"]
+                t3 = levels["t3"]
+                risk_per = levels["risk_per"]
+            else:
+                entry = row[6]
+                sl = row[7]
+                t1 = row[8]
+                t2 = row[9]
+                t3 = row[10]
+                risk_per = row[15]
+            
+            out.append({
+                "symbol": sym, "company": row[1], "sector": row[2], "direction": direction,
+                "score": row[4], "live_price": current_price, "entry": entry, "sl": sl,
+                "t1": t1, "t2": t2, "t3": t3, "adx": row[11], "rsi": row[12],
+                "vol_ratio": row[13], "risk_pct": row[14], "risk_per": risk_per,
+                "recommended": trade_type
+            })
+        conn.close()
+        
+        return jsonify({"stocks": out, "total": len(out)})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/scanner-cached")
 def scanner_cached():
-    """Get cached scanner results from database (fast, no re-scan)"""
+    """Get cached scanner results from database with FRESH live prices"""
     ms = int(request.args.get("min_score", 0))
     sec = request.args.get("sector", "")
     dr = request.args.get("direction", "")
     rec = request.args.get("type", "")
     quality = request.args.get("quality", "all")  # all, prime, high
     
+    # Get FRESH live prices from database cache (updated by background scanner)
+    live_prices_list = get_all_live_prices_db()
+    fresh_prices = {p['symbol']: p['price'] for p in live_prices_list if p.get('price')}
+    fresh_changes = {p['symbol']: p['day_change_pct'] for p in live_prices_list}
+    print(f"[SCANNER-CACHED] fresh_prices keys sample: {list(fresh_prices.keys())[:5]}")
+    print(f"[SCANNER-CACHED] 360ONE price: {fresh_prices.get('360ONE')}")
+    
+    # Import compute_levels for recalculating entry prices
+    from engine import compute_levels
+    
     conn = get_db()
     
     # Base query - use sector_analysis as the main source for scanned data
     query = """
         SELECT symbol, company, sector, direction, score, live_price, entry_price, 
-               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, 
-               e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
-               index_tag, index_weight,
-               ai_prediction, ai_confidence, momentum_score, updated_at
+               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
+               ai_confidence, momentum_score, updated_at, entry_time
         FROM sector_analysis 
-        WHERE 1=1
+        WHERE live_price > 0
     """
     params = []
     
     # Add quality filters for more trustworthy signals
-    if quality == "prime":
-        query += " AND score >= 7 AND adx >= 20 AND vol_ratio >= 1.0"
+    if quality == "elite":
+        # Elite: Highest confidence - strict filters
+        query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.0 AND ai_confidence >= 60"
     elif quality == "high":
-        query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.5"
-    elif quality == "elite":
-        query += """
-            AND score >= 8
-            AND adx >= 25
-            AND vol_ratio >= 1.2
-            AND ai_confidence >= 70
-            AND entry_price > 0
-            AND live_price > 0
-            AND abs((live_price - entry_price) / entry_price) <= 0.012
-            AND va_low > 0 AND va_high > 0
-            AND live_price BETWEEN va_low AND va_high
-            AND (
-                (direction = 'LONG' AND st_dir = 1)
-                OR
-                (direction = 'SHORT' AND st_dir = -1)
-            )
-        """
+        # High: Strong signals
+        query += " AND score >= 7.5 AND adx >= 22 AND vol_ratio >= 0.8"
+    elif quality == "prime":
+        # Prime: Good signals
+        query += " AND score >= 7 AND adx >= 18 AND vol_ratio >= 0.7"
     else:
         # Default behavior: show everything that has been scanned
         if ms > 0:
@@ -2012,18 +2250,48 @@ def scanner_cached():
     cur = conn.execute(query, params)
     out = []
     for row in cur.fetchall():
+        sym = row[0]
+        direction = row[3]
+        trade_type = row[17]
+        stored_atr = row[16] or 0
+        
+        # Use FRESH live price from database cache
+        current_price = fresh_prices.get(sym)
+        if not current_price:
+            current_price = row[5]
+        
+        # Always calculate fresh ATR and levels using current price
+        if current_price and current_price > 0:
+            atr = current_price * 0.015
+            levels = compute_levels(current_price, atr, direction, trade_type if trade_type else "SWING")
+            entry = levels["entry"]
+            sl = levels["sl"]
+            t1 = levels["t1"]
+            t2 = levels["t2"]
+            t3 = levels["t3"]
+            risk_per = levels["risk_per"]
+            calculated_atr = round(atr, 2)
+        else:
+            entry = row[6]
+            sl = row[7]
+            t1 = row[8]
+            t2 = row[9]
+            t3 = row[10]
+            risk_per = row[15]
+            calculated_atr = stored_atr
+        
+        day_change_pct = fresh_changes.get(sym, 0)
+        
         out.append({
-            "symbol": row[0], "company": row[1], "sector": row[2], "direction": row[3],
-            "score": row[4], "live_price": row[5], "entry": row[6], "sl": row[7],
-            "t1": row[8], "t2": row[9], "t3": row[10], "adx": row[11], "rsi": row[12],
-            "vol_ratio": row[13], "risk_pct": row[14], "risk_per": row[15], "atr": row[16],
-            "recommended": row[17],
-            "e20": row[18], "e50": row[19], "e200": row[20],
-            "supertrend": row[21], "st_dir": row[22],
-            "vwap": row[23], "poc": row[24], "va_low": row[25], "va_high": row[26],
-            "index_tag": row[27], "index_weight": row[28],
-            "ai_target": row[29], "ai_confidence": row[30],
-            "momentum_score": row[31], "updated_at": row[32]
+            "symbol": sym, "company": row[1], "sector": row[2], "direction": direction,
+            "score": row[4], "live_price": current_price, "entry": entry, "sl": sl,
+            "t1": t1, "t2": t2, "t3": t3, "adx": row[11], "rsi": row[12],
+            "vol_ratio": row[13], "risk_pct": row[14], "risk_per": risk_per, "atr": calculated_atr,
+            "recommended": trade_type,
+            "ai_confidence": row[18],
+            "momentum_score": row[19], "updated_at": row[20],
+            "entry_time": row[21] if len(row) > 21 else "",
+            "day_change_pct": day_change_pct
         })
     conn.close()
     
@@ -2250,6 +2518,64 @@ def history(sym):
         return jsonify({"sym": sym, "signals": sigs, "ohlcv": ohlcv, "total": len(sigs)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/signals/stats")
+def signals_stats():
+    """Clear signal statistics - how many generated, how many achieved"""
+    import datetime
+    conn = get_db()
+    
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    
+    # Get all signals for today
+    all_signals = conn.execute("""
+        SELECT * FROM signal_log 
+        WHERE signal_date >= ?
+        ORDER BY logged_at DESC
+    """, (today,)).fetchall()
+    
+    signals = [dict(r) for r in all_signals]
+    
+    # Count by trade type
+    swing_count = sum(1 for s in signals if s.get('trade_type') == 'SWING')
+    intra_count = sum(1 for s in signals if s.get('trade_type') == 'INTRA')
+    
+    # Count achieved (triggered or exited with profit)
+    # A signal is "achieved" if it hit T1 or T2 or has triggered_at
+    achieved_count = sum(1 for s in signals if s.get('triggered_at') or s.get('pnl', 0) > 0)
+    
+    # Count not achieved (still active or expired without hitting target)
+    not_achieved = len(signals) - achieved_count
+    
+    # Detailed breakdown by trade type
+    swing_achieved = sum(1 for s in signals if s.get('trade_type') == 'SWING' and (s.get('triggered_at') or s.get('pnl', 0) > 0))
+    intra_achieved = sum(1 for s in signals if s.get('trade_type') == 'INTRA' and (s.get('triggered_at') or s.get('pnl', 0) > 0))
+    
+    conn.close()
+    
+    return jsonify({
+        "date": today,
+        "total_signals": len(signals),
+        "swing": {
+            "generated": swing_count,
+            "achieved": swing_achieved,
+            "not_achieved": swing_count - swing_achieved,
+            "success_rate": round(swing_achieved/swing_count*100, 1) if swing_count > 0 else 0
+        },
+        "intra": {
+            "generated": intra_count,
+            "achieved": intra_achieved,
+            "not_achieved": intra_count - intra_achieved,
+            "success_rate": round(intra_achieved/intra_count*100, 1) if intra_count > 0 else 0
+        },
+        "overall": {
+            "total_generated": len(signals),
+            "total_achieved": achieved_count,
+            "total_not_achieved": not_achieved,
+            "success_rate": round(achieved_count/len(signals)*100, 1) if len(signals) > 0 else 0
+        },
+        "recent_signals": signals[:20]
+    })
 
 @app.route("/api/backtest", methods=["GET", "POST"])
 def backtest_route():
@@ -2535,10 +2861,15 @@ def _load_whatsapp_config():
 def _send_whatsapp_callmebot(phone, apikey, text):
     try:
         import urllib.parse, urllib.request
+        # Use TextMeBot API
         q = urllib.parse.urlencode({"phone": phone, "text": text, "apikey": apikey})
-        url = f"https://api.callmebot.com/whatsapp.php?{q}"
+        url = f"https://api.textmebot.com/send.php?{q}"
+        print(f"[WHATSAPP] Calling: {url[:80]}...")
         with urllib.request.urlopen(url, timeout=10) as resp:
-            _ = resp.read()
+            body = resp.read().decode()
+            print(f"[WHATSAPP] Response: {body}")
+            if "error" in body.lower():
+                return False
         return True
     except Exception as e:
         p = str(phone)
@@ -2573,13 +2904,14 @@ def _maybe_send_whatsapp_signal(signal_data):
     cfg = _load_whatsapp_config()
     if not cfg.get("send_on", {}).get("signals", True):
         return
-    thr = int(cfg.get("thresholds", {}).get("signal_min_score", 8))
+    thr = int(cfg.get("thresholds", {}).get("signal_min_score", 7))
     score = float(signal_data.get("score") or 0)
     adx = float(signal_data.get("adx") or 0)
     vr = float(signal_data.get("vol_ratio") or 0)
     if score < thr:
         return
-    if adx < 25 or vr < 1.2:
+    # Lower threshold for ADX to send more WhatsApp alerts
+    if adx < 20 or vr < 1.0:
         return
     event_key = f"signal:{signal_data.get('date')}:{signal_data.get('symbol')}:{signal_data.get('trade_type','SWING')}"
     msg = (
@@ -2670,10 +3002,70 @@ def ack_alert():
 
 @app.route("/api/signals/log")
 def get_signal_history():
-    """Get historical signal log."""
+    """Get historical signal log with live status."""
     limit = int(request.args.get("limit", 100))
-    signals = get_signal_log(limit)
-    return jsonify({"signals": signals})
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    
+    conn = get_db()
+    signals = [dict(r) for r in conn.execute("""
+        SELECT * FROM signal_log 
+        WHERE signal_date = ?
+        ORDER BY signal_time DESC, score DESC
+        LIMIT ?
+    """, (today, limit)).fetchall()]
+    
+    # Get live prices to check status
+    live_prices = {p['symbol']: p['price'] for p in get_all_live_prices_db()}
+    
+    # Update status based on live prices
+    for s in signals:
+        sym = s.get('symbol')
+        lp = live_prices.get(sym, 0)
+        if lp > 0:
+            s['current_price'] = lp
+            entry = s.get('entry', 0)
+            sl = s.get('sl', 0)
+            t1 = s.get('t1', 0)
+            t2 = s.get('t2', 0)
+            direction = s.get('direction', 'LONG')
+            result = s.get('result', 'PENDING')
+            
+            # Use tracked result if available
+            if result and result != 'PENDING':
+                s['status'] = result
+                s['target_hit'] = result
+            else:
+                # Calculate P&L
+                if direction == 'LONG':
+                    pnl_points = round(lp - entry, 2) if entry else 0
+                    if lp <= sl:
+                        s['status'] = 'STOP_HIT'
+                        s['target_hit'] = 'NO'
+                    elif lp >= t1:
+                        s['status'] = 'TARGET_HIT'
+                        s['target_hit'] = 'T1'
+                    elif lp >= t2:
+                        s['status'] = 'TARGET_HIT'
+                        s['target_hit'] = 'T2'
+                    else:
+                        s['status'] = 'ACTIVE'
+                else:  # SHORT
+                    pnl_points = round(entry - lp, 2) if entry else 0
+                    if lp >= sl:
+                        s['status'] = 'STOP_HIT'
+                        s['target_hit'] = 'NO'
+                    elif lp <= t1:
+                        s['status'] = 'TARGET_HIT'
+                        s['target_hit'] = 'T1'
+                    elif lp <= t2:
+                        s['status'] = 'TARGET_HIT'
+                        s['target_hit'] = 'T2'
+                    else:
+                        s['status'] = 'ACTIVE'
+                s['pnl_points'] = pnl_points
+    
+    conn.close()
+    return jsonify({"signals": signals, "total": len(signals)})
 
 @app.route("/api/live-prices")
 def live_prices():

@@ -864,13 +864,13 @@ def compute_levels(close, atr, direction, trade_type="SWING", capital=100000, ri
         t2     = round(close + m * atr * 2.5, 2)
         t3     = round(close + m * atr * 4.0, 2)
     else:  # SWING (default)
-        # Entry slightly better than current price (pullback entry)
-        entry  = round(close - m * atr * 0.5, 2)
+        # Entry at current price (market entry for real-time signals)
+        entry  = round(close, 2)
         rk     = round(atr * 1.5, 2)  # 1.5x ATR risk for swing
         sl     = round(entry - m * rk, 2)
-        t1     = round(entry + m * rk * 2.5, 2)
-        t2     = round(entry + m * rk * 4.5, 2)
-        t3     = round(entry + m * rk * 7.0, 2)
+        t1     = round(entry + m * rk * 2.0, 2)
+        t2     = round(entry + m * rk * 3.5, 2)
+        t3     = round(entry + m * rk * 5.0, 2)
         
     risk_per_share = abs(entry - sl)
     qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
