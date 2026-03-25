@@ -793,6 +793,10 @@ def score_candle(row, ind, rows_context=None):
     if f13b: bs += 0.5
     if f13s: ss += 0.5
     
+    # Bonus filters
+    ema_gc = (e9 > e20) if e20 else False
+    near_ema20 = abs(c - e20) / e20 < 0.02 if e20 else False
+    
     if ema_gc: bs += 1
     if near_ema20: bs += 0.5
     

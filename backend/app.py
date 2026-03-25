@@ -32,7 +32,9 @@ def get_db():
     return conn
 
 def init_db():
+    """Initialize SQLite database and ensure all columns exist."""
     conn = get_db()
+    # Base tables
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +62,33 @@ def init_db():
         pnl REAL DEFAULT 0,
         logged_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS sector_analysis (
+        symbol TEXT PRIMARY KEY,
+        sector TEXT, company TEXT, direction TEXT,
+        score REAL, live_price REAL, entry_price REAL,
+        sl REAL, t1 REAL, t2 REAL, t3 REAL,
+        adx REAL, rsi REAL, vol_ratio REAL,
+        risk_pct REAL, risk_per REAL, atr REAL, trade_type TEXT,
+        ai_prediction REAL, ai_confidence INTEGER,
+        momentum_score INTEGER, updated_at TEXT
+    );
+    """)
+    
+    # Check for missing columns in sector_analysis (for migrations)
+    cursor = conn.execute("PRAGMA table_info(sector_analysis)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    if "t3" not in columns:
+        print("[DB] Adding missing column 't3' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN t3 REAL DEFAULT 0")
+    if "risk_per" not in columns:
+        print("[DB] Adding missing column 'risk_per' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN risk_per REAL DEFAULT 0")
+    if "atr" not in columns:
+        print("[DB] Adding missing column 'atr' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN atr REAL DEFAULT 0")
+        
+    conn.executescript("""
     CREATE TABLE IF NOT EXISTS price_cache (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT UNIQUE, date TEXT,
@@ -92,16 +121,6 @@ def init_db():
         adx REAL, rsi REAL,
         acknowledged INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS sector_analysis (
-        symbol TEXT PRIMARY KEY,
-        sector TEXT, company TEXT, direction TEXT,
-        score REAL, live_price REAL, entry_price REAL,
-        sl REAL, t1 REAL, t2 REAL,
-        adx REAL, rsi REAL, vol_ratio REAL,
-        risk_pct REAL, trade_type TEXT,
-        ai_prediction REAL, ai_confidence INTEGER,
-        momentum_score INTEGER, updated_at TEXT
     );
     CREATE TABLE IF NOT EXISTS ai_predictions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +281,7 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
         adx = meta.get("adx", 0)
         rsi = meta.get("rsi", 50)
         vr = meta.get("vr", 1)
+        atr = ind.get("atr", 0)
         
         # AI prediction score (0-100)
         ai_score = min(100, int(score * 11.1))  # score 9 = 100
@@ -274,12 +294,12 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
         
         conn.execute("""
             INSERT OR REPLACE INTO sector_analysis 
-            (sector, symbol, company, direction, score, live_price, entry_price, sl, t1, t2,
-             adx, rsi, vol_ratio, risk_pct, trade_type, ai_prediction, ai_confidence, momentum_score, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (sector, symbol, company, direction, score, live_price, entry_price, sl, t1, t2, t3,
+             adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, ai_prediction, ai_confidence, momentum_score, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (info[3], sym, info[1], direction, score, live_price, levels["entry"],
-              levels["sl"], levels["t1"], levels["t2"], adx, rsi, vr, risk_pct, trade_type,
-              levels.get("t2", 0), confidence, momentum, now))
+              levels["sl"], levels["t1"], levels["t2"], levels.get("t3", 0), adx, rsi, vr, risk_pct, 
+              levels.get("risk_per", 0), atr, trade_type, levels.get("t2", 0), confidence, momentum, now))
         
         conn.commit()
         conn.close()
@@ -338,20 +358,28 @@ def _generate_ai_predictions():
         pass
 
 def _start_background_scanner():
-    """Start the background scanner in a separate thread."""
-    global _scanner_running, _scanner_thread
+    """Start the background scanner thread."""
+    global _scanner_running
     if _scanner_running:
         return
     _scanner_running = True
-    _scanner_thread = threading.Thread(target=_background_scanner_loop, daemon=True)
-    _scanner_thread.start()
-    print("[SCANNER] Background scanner started (60s interval)")
+    t = threading.Thread(target=_background_scanner_loop, daemon=True)
+    t.start()
+    print("[SCANNER] Background scanner started")
 
 def _background_scanner_loop():
     """Continuously scan for momentum changes every 60 seconds."""
-    global _scanner_running
+    global _scanner_running, _zerodha_ready
     interval = 60  # seconds
     last_full_scan = 0
+    
+    # Wait for Zerodha to be ready if enabled
+    cfg = gcfg()
+    if cfg.get("use_zerodha_ltp", True):
+        max_wait = 30
+        while not _zerodha_ready and max_wait > 0:
+            time.sleep(1)
+            max_wait -= 1
     
     while _scanner_running:
         try:
@@ -378,6 +406,7 @@ def _full_universe_scan():
     cfg = gcfg()
     use_real = cfg.get("use_real", True)
     
+    # Use the global get_zerodha_live_prices function
     live_prices = get_zerodha_live_prices([u[0] for u in UNIVERSE])
     
     _ml_data_cache = {}
@@ -464,8 +493,11 @@ def _full_universe_scan():
         except:
             continue
     
-    # Re-train models with the freshly scanned data
     if scanned_count > 0:
+        # Save to DB immediately after each full scan to ensure persistence
+        print(f"[DB] Saving {scanned_count} analyzed stocks to persistent cache...")
+        # (This is already handled by _store_sector_analysis inside the loop)
+        
         print(f"[ML] Training models on {scanned_count} symbols with latest market data...")
         _train_models(_ml_data_cache)
 
@@ -576,11 +608,14 @@ def _load_simple_env_file():
     print(f"[ENV] .env exists: {os.path.exists(env_path)}")
     if not os.path.exists(env_path):
         env_path = fallback_env_path
-    if not os.path.exists(env_path):
-        return
+    
+    # ALWAYS load from .env.txt if it exists, as it has the freshest token
+    if os.path.exists(fallback_env_path):
+        env_path = fallback_env_path
+        
     print(f"[ENV] Loading from: {env_path}")
     try:
-        with open(env_path, "r", encoding="utf-8") as f:
+        with open(env_path, "r", encoding="utf-8-sig") as f: # Use utf-8-sig to handle BOM
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -590,11 +625,13 @@ def _load_simple_env_file():
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip()
-                if k and k not in os.environ:
+                if k:
+                    # Force overwrite with .env.txt values
                     os.environ[k] = v
     except Exception as e:
         print(f"[ENV] Failed to load .env.txt: {e}")
     print(f"[ENV] KITE_ACCESS_TOKEN = {os.environ.get('KITE_ACCESS_TOKEN', 'NOT SET')}")
+    print(f"[ENV] KITE_API_KEY = {os.environ.get('KITE_API_KEY', 'NOT SET')}")
 
 _load_simple_env_file()
 
@@ -613,8 +650,9 @@ def scfg(d):
         json.dump(d, f, indent=2)
 
 
-# Start background scanner
-_start_background_scanner()
+_zerodha_ready = False
+
+# def _start_background_scanner():  # Redundant definition removed
 
 # ── DATA HELPERS ─────────────────────────
 _cache_time = {}  # sym -> timestamp
@@ -636,14 +674,39 @@ def _maybe_start_zerodha_ltp_stream(run_in_main_thread=False):
 
     api_key = os.environ.get("KITE_API_KEY", "").strip()
     access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
+    
+    # Debug print
+    print(f"[ZERODHA] Initializing with key={api_key[:5]}... and token={access_token[:5]}...")
+    
     # KITE_API_SECRET is not strictly required for streaming with access_token,
     # but we load it anyway for completeness.
-    _ = os.environ.get("KITE_API_SECRET", "").strip()
+    api_secret = os.environ.get("KITE_API_SECRET", "").strip()
     if not api_key or not access_token:
         return
 
     _zerodha_ready = False
+    try:
+        from kiteconnect import KiteConnect, KiteTicker
+    except Exception as e:
+        print(f"[ZERODHA] kiteconnect not installed/available: {e}", flush=True)
+        return
+
+    try:
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+        print(f"[ZERODHA] Manual check with key={api_key[:5]} and token={access_token[:5]}...")
+        profile = kite.profile()
+        print(f"[ZERODHA] Auth SUCCESS! User: {profile.get('user_name')}")
+        _zerodha_ready = True
+    except Exception as e:
+        print(f"[ZERODHA] Auth FAILED: {e}")
+        # If manual check fails, don't even try the worker to avoid spamming
+        # But we'll let it continue for now to see if it somehow works in the worker
+
     _ltp_stream_thread_started = True
+    
+    # Start background scanner only after Zerodha is confirmed ready
+    _start_background_scanner()
 
     def _worker():
         nonlocal api_key, access_token
@@ -952,21 +1015,40 @@ def make_signal(sym, info, rows, inds, idx, sc, dr, fl, meta, entry_time=None):
 def get_intra_signals():
     """Get high-accuracy intraday signals from DB."""
     conn = get_db()
-    rows = [dict(r) for r in conn.execute(
+    signals = [dict(r) for r in conn.execute(
         "SELECT * FROM signal_log WHERE trade_type = 'INTRA' AND score >= 7 ORDER BY logged_at DESC LIMIT 50"
     ).fetchall()]
+    
+    current = [dict(r) for r in conn.execute("""
+        SELECT symbol, company, sector, direction, score, live_price, entry_price as entry, 
+               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type as recommended
+        FROM sector_analysis 
+        WHERE trade_type = 'INTRA' AND score >= 7
+        ORDER BY score DESC, momentum_score DESC
+    """).fetchall()]
+    
     conn.close()
-    return jsonify({"signals": rows})
+    return jsonify({"signals": signals, "current": current})
 
 @app.route("/api/signals/swing")
 def get_swing_signals():
     """Get high-accuracy swing signals from DB."""
     conn = get_db()
-    rows = [dict(r) for r in conn.execute(
+    # Return both signal_log history and current scanner analysis for swing
+    signals = [dict(r) for r in conn.execute(
         "SELECT * FROM signal_log WHERE trade_type = 'SWING' AND score >= 7 ORDER BY logged_at DESC LIMIT 50"
     ).fetchall()]
+    
+    current = [dict(r) for r in conn.execute("""
+        SELECT symbol, company, sector, direction, score, live_price, entry_price as entry, 
+               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type as recommended
+        FROM sector_analysis 
+        WHERE trade_type = 'SWING' AND score >= 7
+        ORDER BY score DESC, momentum_score DESC
+    """).fetchall()]
+    
     conn.close()
-    return jsonify({"signals": rows})
+    return jsonify({"signals": signals, "current": current})
 
 @app.after_request
 def cors(r):
@@ -985,12 +1067,25 @@ def root(p):
 @app.route("/api/status")
 def status():
     cfg = gcfg()
-    has_zerodha = bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
     
-    # Get sector stats from database
+    # Get total universe size
+    total_universe = len(UNIVERSE)
+    
+    # Get stats from database
+    prime_count = 0
+    long_count = 0
+    short_count = 0
     sector_stats = {}
+    
     try:
         conn = get_db()
+        # Prime: score >= 7
+        prime_count = conn.execute("SELECT COUNT(*) FROM sector_analysis WHERE score >= 7").fetchone()[0]
+        # Long: direction = 'LONG'
+        long_count = conn.execute("SELECT COUNT(*) FROM sector_analysis WHERE direction = 'LONG'").fetchone()[0]
+        # Short: direction = 'SHORT'
+        short_count = conn.execute("SELECT COUNT(*) FROM sector_analysis WHERE direction = 'SHORT'").fetchone()[0]
+        
         cur = conn.execute("""
             SELECT sector, COUNT(*) as count, AVG(score) as avg_score, AVG(momentum_score) as avg_momentum
             FROM sector_analysis 
@@ -1001,17 +1096,20 @@ def status():
         for row in cur.fetchall():
             sector_stats[row[0]] = {"count": row[1], "avg_score": round(row[2], 1), "avg_momentum": round(row[3], 1)}
         conn.close()
-    except:
-        pass
+    except Exception as e:
+        print(f"[STATUS ERROR] {e}")
     
     return jsonify({
         "ok":           True,
         "version":      "7.0",
         "python":       sys.version.split()[0],
         "capital":      cfg["capital"],
-        "zerodha":      has_zerodha,
+        "zerodha":      bool(os.environ.get("KITE_ACCESS_TOKEN")),
         "data_mode":    "REAL (Zerodha)" if cfg.get("use_real") else "SYNTHETIC",
-        "universe":     len(UNIVERSE),
+        "universe":     total_universe,
+        "prime_count":  prime_count,
+        "long_count":   long_count,
+        "short_count":  short_count,
         "cached":       len(_cache),
         "sectors":      SECTORS,
         "filter_names": FILTER_NAMES,
@@ -1237,21 +1335,26 @@ def scanner_cached():
     
     conn = get_db()
     
-    # Base query
+    # Base query - use sector_analysis as the main source for scanned data
     query = """
         SELECT symbol, company, sector, direction, score, live_price, entry_price, 
-               sl, t1, t2, adx, rsi, vol_ratio, risk_pct, trade_type, 
+               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, 
                ai_prediction, ai_confidence, momentum_score, updated_at
         FROM sector_analysis 
-        WHERE score >= ?
+        WHERE 1=1
     """
-    params = [ms]
+    params = []
     
     # Add quality filters for more trustworthy signals
     if quality == "prime":
         query += " AND score >= 7 AND adx >= 20 AND vol_ratio >= 1.0"
     elif quality == "high":
         query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.5"
+    else:
+        # Default behavior: show everything that has been scanned
+        if ms > 0:
+            query += " AND score >= ?"
+            params.append(ms)
     
     if sec:
         query += " AND sector = ?"
@@ -1271,20 +1374,12 @@ def scanner_cached():
         out.append({
             "symbol": row[0], "company": row[1], "sector": row[2], "direction": row[3],
             "score": row[4], "live_price": row[5], "entry": row[6], "sl": row[7],
-            "t1": row[8], "t2": row[9], "adx": row[10], "rsi": row[11],
-            "vol_ratio": row[12], "risk_pct": row[13], "recommended": row[14],
-            "ai_target": row[15], "ai_confidence": row[16], "momentum_score": row[17],
-            "updated_at": row[18]
+            "t1": row[8], "t2": row[9], "t3": row[10], "adx": row[11], "rsi": row[12],
+            "vol_ratio": row[13], "risk_pct": row[14], "risk_per": row[15], "atr": row[16],
+            "recommended": row[17], "ai_target": row[18], "ai_confidence": row[19], 
+            "momentum_score": row[20], "updated_at": row[21]
         })
     conn.close()
-    
-    # Fetch latest live prices for update
-    live_prices = get_all_live_prices_db()
-    price_map = {r["symbol"]: r["price"] for r in live_prices}
-    
-    for s in out:
-        if s["symbol"] in price_map:
-            s["live_price"] = price_map[s["symbol"]]
     
     return jsonify({"stocks": out, "total": len(out), "cached": True})
 
@@ -1932,6 +2027,17 @@ def swing_trades():
     })
 
 if __name__ == "__main__":
+    # Load .env.txt if .env doesn't exist
+    if not os.path.exists(os.path.join(BASE, "../.env")):
+        env_txt = os.path.join(BASE, "../.env.txt")
+        if os.path.exists(env_txt):
+            print(f"[ENV] Loading from {env_txt}")
+            with open(env_txt) as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        os.environ[k] = v
+
     print("\n" + "="*55)
     print("  Trade Smart v7 — Trading Intelligence System")
     print("  Real-time data from ZERODHA API")
@@ -1949,6 +2055,10 @@ if __name__ == "__main__":
     # If Zerodha streaming is enabled, run the WS connection on the main thread
     # (avoids Twisted signal-handler issues on Windows), while Flask runs in a worker thread.
     use_stream = cfg.get("use_zerodha_ltp", True) and bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
+    
+    # Start background scanner
+    # _start_background_scanner()  # Moved inside _maybe_start_zerodha_ltp_stream for better sync
+    
     if use_stream:
         print("  Zerodha LTP streaming: START")
         flask_thread = threading.Thread(
@@ -1956,6 +2066,8 @@ if __name__ == "__main__":
             daemon=True,
         )
         flask_thread.start()
+        # The background scanner will be started by _maybe_start_zerodha_ltp_stream once ready
         _maybe_start_zerodha_ltp_stream(run_in_main_thread=True)
     else:
+        _start_background_scanner()
         app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False)

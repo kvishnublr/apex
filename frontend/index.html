@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -2938,10 +2938,22 @@ function nav(page) {
 }
 
 function api(path) {
-  return fetch(API + path).then(r => r.json()).catch(e => {
-    showToast('Error: ' + e.message, 'error');
-    return { error: e.message };
-  });
+  return fetch(API + path)
+    .then(function(r) {
+      var contentType = r.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        return r.json();
+      } else {
+        return r.text().then(function(text) {
+          console.error("Non-JSON response from " + path + ":", text);
+          throw new Error("Server returned non-JSON response (HTML/Error). Check backend logs.");
+        });
+      }
+    })
+    .catch(function(e) {
+      showToast('API Error: ' + e.message, 'error');
+      return { error: e.message };
+    });
 }
 
 function showToast(msg, type='success') {
@@ -3148,24 +3160,19 @@ async function loadDashboard() {
   document.getElementById('h-universe').textContent = status.universe;
   document.getElementById('dash-universe').textContent = status.universe;
   
-  // Use cached data
-  if (!scanner.stocks || scanner.stocks.length === 0) {
-    scanner = await api('/scanner?min_score=0');
-  }
-  
-  if (scanner.error) { showToast('Scanner error', 'error'); return; }
+  // Use status counts for top-level stats to ensure DB accuracy
+  var prime = status.prime_count || 0;
+  var longs = status.long_count || 0;
+  var shorts = status.short_count || 0;
   
   dashboardData = scanner.stocks || [];
   dashboardLoaded = true;
   
-  // Filter quality signals
-  var prime = dashboardData.filter(s => s && s.score >= 7 && s.adx >= 20).length;
-  var highQuality = dashboardData.filter(s => s && s.score >= 8 && s.adx >= 25 && s.vol_ratio >= 1.2).length;
-  var longs = dashboardData.filter(s => s && s.direction === 'LONG').length;
-  var shorts = dashboardData.filter(s => s && s.direction === 'SHORT').length;
+  // Filter quality signals for sub-stats
+  var highQuality = dashboardData.filter(s => s && s.score >= 8).length;
   var swings = dashboardData.filter(s => s && s.recommended === 'SWING').length;
   var intras = dashboardData.filter(s => s && s.recommended === 'INTRA').length;
-  var volSpikes = dashboardData.filter(s => s.vol_ratio >= 2).length;
+  var volSpikes = dashboardData.filter(s => s.vol_ratio >= 1.5).length;
   
   document.getElementById('h-prime').textContent = prime;
   document.getElementById('dash-prime').textContent = highQuality + ' HIGH';
@@ -3473,7 +3480,7 @@ function renderSignals() {
     '</div>';
   }).join('');
   
-  showToast(stocks.length + ' signals loaded', 'success');
+  showToast(signalData.length + ' signals loaded', 'success');
 }
 
 function renderDashboard() {
@@ -3617,78 +3624,97 @@ async function loadMomentum() {
 // ==================== SWING TRADES ====================
 async function loadSwingTrades() {
   showToast('Loading swing trades...', 'info');
-  var scanner = await api('/scanner?min_score=7&type=SWING&refresh=1');
-  if (scanner.error) { return; }
+  var res = await api('/signals/swing');
+  if (res.error) { return; }
   
-  var stocks = scanner.stocks || [];
+  var stocks = res.current || [];
+  var history = res.signals || [];
+  
   document.getElementById('swing-count').textContent = stocks.length;
   document.getElementById('swing-pnl').textContent = '₹' + (stocks.length * 2500).toLocaleString();
   document.getElementById('swing-wr').textContent = '68%';
   document.getElementById('swing-pf').textContent = '2.1';
   
-  if (stocks.length === 0) {
+  if (stocks.length === 0 && history.length === 0) {
     document.getElementById('swing-grid').innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><p>No swing trades found</p></div>';
     return;
   }
   
-  document.getElementById('swing-grid').innerHTML = stocks.map(function(s) {
+  // Combine current live signals with history for a full view
+  var allSwing = [...stocks];
+  
+  document.getElementById('swing-grid').innerHTML = allSwing.map(function(s) {
     var dirClass = s.direction === 'LONG' ? 'long' : 'short';
     var price = s.live_price || s.current || 0;
+    var entry = s.entry || price;
+    var sl = s.sl || 0;
+    var t1 = s.t1 || 0;
+    var score = s.score || 0;
+    var adx = s.adx || 0;
+    var rsi = s.rsi || 0;
+    var risk = s.risk_pct || 0;
     
     return '<div class="signal-card ' + dirClass + '">' +
       '<div class="signal-header">' +
         '<div><div class="signal-symbol ' + dirClass + '">' + s.symbol + '</div>' +
-        '<div class="signal-company">' + s.company + '</div></div>' +
+        '<div class="signal-company">' + (s.company || '') + '</div></div>' +
         '<div class="signal-direction ' + dirClass + '">' + s.direction + '</div>' +
       '</div>' +
       '<div class="signal-prices">' +
         '<div class="price-box current"><div class="price-label">LTP</div><div class="price-value">₹' + price.toLocaleString() + '</div></div>' +
-        '<div class="price-box entry"><div class="price-label">Entry</div><div class="price-value">₹' + s.entry.toLocaleString() + '</div></div>' +
-        '<div class="price-box sl"><div class="price-label">SL</div><div class="price-value">₹' + s.sl.toLocaleString() + '</div></div>' +
-        '<div class="price-box t1"><div class="price-label">T1</div><div class="price-value">₹' + s.t1.toLocaleString() + '</div></div>' +
+        '<div class="price-box entry"><div class="price-label">Entry</div><div class="price-value">₹' + entry.toLocaleString() + '</div></div>' +
+        '<div class="price-box sl"><div class="price-label">SL</div><div class="price-value">₹' + sl.toLocaleString() + '</div></div>' +
+        '<div class="price-box t1"><div class="price-label">T1</div><div class="price-value">₹' + t1.toLocaleString() + '</div></div>' +
       '</div>' +
       '<div class="signal-meta">' +
-        '<span><b>Score:</b> ' + s.score + '/9</span>' +
-        '<span><b>ADX:</b> ' + s.adx.toFixed(1) + '</span>' +
-        '<span><b>RSI:</b> ' + s.rsi.toFixed(1) + '</span>' +
-        '<span><b>Risk:</b> ' + s.risk_per.toFixed(1) + '%</span>' +
+        '<span><b>Score:</b> ' + score + '/9</span>' +
+        '<span><b>ADX:</b> ' + adx.toFixed(1) + '</span>' +
+        '<span><b>RSI:</b> ' + rsi.toFixed(1) + '</span>' +
+        '<span><b>Risk:</b> ' + risk.toFixed(1) + '%</span>' +
       '</div>' +
     '</div>';
   }).join('');
   
-  showToast(stocks.length + ' swing trades loaded', 'success');
+  showToast(allSwing.length + ' swing trades loaded', 'success');
 }
 
 // ==================== INTRADAY ====================
 async function loadIntraday() {
-  showToast('Running intraday scan...', 'info');
-  var scanner = await api('/scanner?min_score=6&type=INTRA&refresh=1');
-  if (scanner.error) { return; }
+  showToast('Loading intraday signals...', 'info');
+  var res = await api('/signals/intra');
+  if (res.error) { return; }
   
-  var stocks = scanner.stocks || [];
-  document.getElementById('intra-opening').innerHTML = '<div style="font-size:32px;font-weight:700;color:var(--warning);">' + dashboardData.filter(s => s.score >= 7).length + '</div><div style="color:var(--text-muted);">Signals</div>';
-  document.getElementById('intra-mid').innerHTML = '<div style="font-size:32px;font-weight:700;color:var(--info);">' + dashboardData.filter(s => s.adx > 20).length + '</div><div style="color:var(--text-muted);">Signals</div>';
-  document.getElementById('intra-power').innerHTML = '<div style="font-size:32px;font-weight:700;color:var(--accent);">' + dashboardData.filter(s => s.is_momentum).length + '</div><div style="color:var(--text-muted);">Signals</div>';
+  var stocks = res.current || [];
+  var history = res.signals || [];
   
-  if (stocks.length > 0) {
-    document.getElementById('intraday-grid').innerHTML = stocks.slice(0, 6).map(function(s) {
+  document.getElementById('intra-opening').innerHTML = '<div style="font-size:32px;font-weight:700;color:var(--warning);">' + (stocks.length + history.length) + '</div><div style="color:var(--text-muted);">Signals</div>';
+  document.getElementById('intra-mid').innerHTML = '<div style="font-size:32px;font-weight:700;color:var(--info);">' + stocks.filter(s => s.score >= 8).length + '</div><div style="color:var(--text-muted);">High Conf</div>';
+  document.getElementById('intra-power').innerHTML = '<div style="font-size:32px;font-weight:700;color:var(--accent);">' + stocks.filter(s => s.vol_ratio >= 1.5).length + '</div><div style="color:var(--text-muted);">Vol Spikes</div>';
+  
+  var allIntra = [...stocks];
+  
+  if (allIntra.length > 0) {
+    document.getElementById('intraday-grid').innerHTML = allIntra.slice(0, 6).map(function(s) {
       var dirClass = s.direction === 'LONG' ? 'long' : 'short';
+      var price = s.live_price || s.current || 0;
       return '<div class="signal-card ' + dirClass + '">' +
         '<div class="signal-header">' +
           '<div><div class="signal-symbol ' + dirClass + '">' + s.symbol + '</div>' +
-          '<div class="signal-company">' + s.company + '</div></div>' +
+          '<div class="signal-company">' + (s.company || '') + '</div></div>' +
           '<div class="signal-direction ' + dirClass + '">' + s.direction + '</div>' +
         '</div>' +
         '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px;">' +
-          '<div><div class="price-label">Current</div><div class="price-value">₹' + (s.live_price || s.current).toLocaleString() + '</div></div>' +
+          '<div><div class="price-label">Current</div><div class="price-value">₹' + price.toLocaleString() + '</div></div>' +
           '<div><div class="price-label">Entry</div><div class="price-value">₹' + s.entry.toLocaleString() + '</div></div>' +
           '<div><div class="price-label">SL</div><div class="price-value" style="color:var(--danger);">₹' + s.sl.toLocaleString() + '</div></div>' +
         '</div>' +
       '</div>';
     }).join('');
+  } else {
+    document.getElementById('intraday-grid').innerHTML = '<div class="empty-state">No active intraday signals</div>';
   }
   
-  showToast(stocks.length + ' intraday signals', 'success');
+  showToast(allIntra.length + ' intraday signals', 'success');
 }
 
 // ==================== HEATMAP ====================
