@@ -3,7 +3,7 @@ APEX NSE Engine v7
 Data source: Zerodha Kite API ONLY
 No Yahoo Finance dependency
 """
-import math, random, datetime, json, statistics
+import math, random, datetime, json, statistics, os
 
 try:
     import numpy as np
@@ -333,18 +333,33 @@ def gen_ohlcv(info, months=9):
 _zerodha_kite_instance = None
 _zerodha_token_map = {}
 
+
+def _load_local_env():
+    import os
+    root = os.path.dirname(os.path.dirname(__file__))
+    for name in ('.env', '.env.txt'):
+        env_path = os.path.join(root, name)
+        if not os.path.exists(env_path):
+            continue
+        try:
+            with open(env_path, 'r', encoding='utf-8-sig') as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    os.environ[key.strip()] = value.strip()
+        except Exception:
+            continue
+
+
 def _get_zerodha_kite():
     """Get or create KiteConnect instance"""
     global _zerodha_kite_instance
     if _zerodha_kite_instance is not None:
         return _zerodha_kite_instance
     
-    import os
-    # Ensure env is loaded
-    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-    if os.path.exists(env_path):
-        from dotenv import load_dotenv
-        load_dotenv(env_path)
+    _load_local_env()
     
     api_key = os.environ.get("KITE_API_KEY", "").strip()
     access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
@@ -367,12 +382,7 @@ def _build_token_map():
     if _zerodha_token_map:
         return
     
-    # Ensure env is loaded
-    import os
-    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-    if os.path.exists(env_path):
-        from dotenv import load_dotenv
-        load_dotenv(env_path)
+    _load_local_env()
     
     kite = _get_zerodha_kite()
     if not kite:
@@ -1689,3 +1699,4 @@ if __name__ == "__main__":
     for t in res["trades"][:3]:
         print(f"  [{t['num']}] {t['entry_datetime']} | {t['symbol']:12} {t['direction']} score={t['score']}/9 | {t['exit_type']:12} | ₹{t['net_pnl']:+,.0f}")
     print("Engine OK ✓")
+

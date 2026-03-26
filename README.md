@@ -51,7 +51,7 @@
 
 1. Run `INSTALL_V7.bat` — installs Flask (required) + yfinance (optional)
 2. Run `START_APEX_V7.bat` to launch
-3. Open http://localhost:5000
+3. Open http://localhost:6060
 
 ## Architecture
 
@@ -98,3 +98,5 @@ apex_v7/
 - `pip install flask` (mandatory)
 - `pip install yfinance` (optional — for real NSE data)
 - No NumPy, No Pandas, No SciPy
+
+

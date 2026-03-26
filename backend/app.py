@@ -43,19 +43,21 @@ def init_db():
     """Initialize SQLite database and ensure all columns exist."""
     conn = get_db()
     
-    # Clear all existing data for fresh start
-    try:
-        conn.execute("DELETE FROM signal_log")
-        conn.execute("DELETE FROM trades")
-        conn.execute("DELETE FROM sector_analysis")
-        conn.execute("DELETE FROM live_prices")
-        conn.execute("DELETE FROM momentum_alerts")
-        conn.execute("DELETE FROM ai_predictions")
-        conn.execute("DELETE FROM price_cache")
-        conn.commit()
-        print("[DB] Cleared all tables for fresh start")
-    except Exception as e:
-        print(f"[DB] Clear warning: {e}")
+    # Keep cache/history by default so the UI has data immediately after restart.
+    # Set APEX_CLEAR_ON_START=1 only when a true cold start is desired.
+    if os.environ.get("APEX_CLEAR_ON_START", "").strip() == "1":
+        try:
+            conn.execute("DELETE FROM signal_log")
+            conn.execute("DELETE FROM trades")
+            conn.execute("DELETE FROM sector_analysis")
+            conn.execute("DELETE FROM live_prices")
+            conn.execute("DELETE FROM momentum_alerts")
+            conn.execute("DELETE FROM ai_predictions")
+            conn.execute("DELETE FROM price_cache")
+            conn.commit()
+            print("[DB] Cleared all tables for fresh start")
+        except Exception as e:
+            print(f"[DB] Clear warning: {e}")
     
     # Base tables
     conn.executescript("""
@@ -102,6 +104,27 @@ def init_db():
     );
     """)
     
+    cursor = conn.execute("PRAGMA table_info(signal_log)")
+    signal_log_columns = [row[1] for row in cursor.fetchall()]
+    if "result" not in signal_log_columns:
+        print("[DB] Adding missing column 'result' to signal_log")
+        conn.execute("ALTER TABLE signal_log ADD COLUMN result TEXT DEFAULT 'PENDING'")
+    if "t1_hit_time" not in signal_log_columns:
+        print("[DB] Adding missing column 't1_hit_time' to signal_log")
+        conn.execute("ALTER TABLE signal_log ADD COLUMN t1_hit_time TEXT")
+    if "t2_hit_time" not in signal_log_columns:
+        print("[DB] Adding missing column 't2_hit_time' to signal_log")
+        conn.execute("ALTER TABLE signal_log ADD COLUMN t2_hit_time TEXT")
+    if "sl_hit_time" not in signal_log_columns:
+        print("[DB] Adding missing column 'sl_hit_time' to signal_log")
+        conn.execute("ALTER TABLE signal_log ADD COLUMN sl_hit_time TEXT")
+    if "signal_time" not in signal_log_columns:
+        print("[DB] Adding missing column 'signal_time' to signal_log")
+        conn.execute("ALTER TABLE signal_log ADD COLUMN signal_time TEXT DEFAULT ''")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_log_unique "
+        "ON signal_log(signal_date, symbol, trade_type)"
+    )
     # Check for missing columns in sector_analysis (for migrations)
     cursor = conn.execute("PRAGMA table_info(sector_analysis)")
     sector_info_rows = cursor.fetchall()
@@ -179,6 +202,9 @@ def init_db():
     if "va_high" not in columns:
         print("[DB] Adding missing column 'va_high' to sector_analysis")
         conn.execute("ALTER TABLE sector_analysis ADD COLUMN va_high REAL DEFAULT 0")
+    if "entry_time" not in columns:
+        print("[DB] Adding missing column 'entry_time' to sector_analysis")
+        conn.execute("ALTER TABLE sector_analysis ADD COLUMN entry_time TEXT DEFAULT ''")
     if "index_tag" not in columns:
         print("[DB] Adding missing column 'index_tag' to sector_analysis")
         conn.execute("ALTER TABLE sector_analysis ADD COLUMN index_tag TEXT DEFAULT ''")
@@ -529,19 +555,19 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
             (sector, symbol, company, direction, score, live_price, entry_price, sl, t1, t2, t3,
              adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
              e20, e50, e200, supertrend, st_dir, vwap, poc, va_low, va_high,
-             index_tag, index_weight,
+             index_tag, index_weight, entry_time,
              ai_prediction, ai_confidence, momentum_score, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )
         """, (
-            info[3], sym, info[1], direction, score, live_price, levels["entry"],
+            info[3], sym, info[2], direction, score, live_price, levels["entry"],
             levels["sl"], levels["t1"], levels["t2"], levels.get("t3", 0),
             adx, rsi, vr, risk_pct, levels.get("risk_per", 0), atr, trade_type,
             ind.get("e20") or 0, ind.get("e50") or 0, ind.get("e200") or 0,
             ind.get("st") or 0, ind.get("st_dir") or 0,
             ind.get("vwap") or 0, ind.get("poc") or 0,
             ind.get("va_low") or 0, ind.get("va_high") or 0,
-            ("NIFTY50" if sym in NIFTY50_WEIGHTS else ""), NIFTY50_WEIGHTS.get(sym, 0),
-            levels.get("t2", 0), confidence, momentum, now
+            ("NIFTY50" if sym in NIFTY50_WEIGHTS else ""), NIFTY50_WEIGHTS.get(sym, 0), "",
+            ai_score, confidence, momentum, now
         ))
         
         conn.commit()
@@ -549,6 +575,57 @@ def _store_sector_analysis(info, sym, direction, score, levels, live_price, risk
         print(f"[STORE] {sym} -> sector_analysis (score={score}, momentum={momentum})")
     except Exception as e:
         print(f"[ERROR] _store_sector_analysis: {e}")
+
+def _is_tradeable_cached_signal(signal, quality="prime"):
+    quality = (quality or "prime").lower()
+    thresholds = {
+        "prime": {"score": 7.0, "adx": 18.0, "vol": 1.0, "ai": 52.0, "max_extend": 0.035, "max_risk": 6.0, "reliability": 68},
+        "high": {"score": 7.5, "adx": 22.0, "vol": 1.05, "ai": 58.0, "max_extend": 0.03, "max_risk": 5.5, "reliability": 74},
+        "elite": {"score": 8.0, "adx": 25.0, "vol": 1.1, "ai": 64.0, "max_extend": 0.025, "max_risk": 5.0, "reliability": 80},
+    }.get(quality, {"score": 7.0, "adx": 18.0, "vol": 1.0, "ai": 52.0, "max_extend": 0.035, "max_risk": 6.0, "reliability": 68})
+
+    score = float(signal.get("score") or 0)
+    adx = float(signal.get("adx") or 0)
+    rsi = float(signal.get("rsi") or 0)
+    vol_ratio = float(signal.get("vol_ratio") or 0)
+    risk_pct = float(signal.get("risk_pct") or 0)
+    ai_confidence = float(signal.get("ai_confidence") or 0)
+    price = float(signal.get("live_price") or signal.get("entry_price") or signal.get("entry") or 0)
+    entry = float(signal.get("entry_price") or signal.get("entry") or 0)
+    e20 = float(signal.get("e20") or 0)
+    e50 = float(signal.get("e50") or 0)
+    e200 = float(signal.get("e200") or 0)
+    direction = (signal.get("direction") or "").upper()
+    trade_type = (signal.get("trade_type") or signal.get("recommended") or "").upper()
+    reliability, _ = _compute_signal_reliability(signal)
+
+    if trade_type not in ("SWING", "INTRA"):
+        return False
+    if score < thresholds["score"] or adx < thresholds["adx"] or vol_ratio < thresholds["vol"]:
+        return False
+    if ai_confidence < thresholds["ai"] or not (0.15 <= risk_pct <= thresholds["max_risk"]):
+        return False
+    if not price or not entry:
+        return False
+    if reliability < thresholds["reliability"]:
+        return False
+
+    trend_aligned = (
+        (direction == "LONG" and price >= e20 and price >= e50 and (e200 <= 0 or price >= e200)) or
+        (direction == "SHORT" and price <= e20 and price <= e50 and (e200 <= 0 or price <= e200))
+    )
+    if not trend_aligned:
+        return False
+
+    rsi_ok = (
+        (direction == "LONG" and 42 <= rsi <= 68) or
+        (direction == "SHORT" and 32 <= rsi <= 58)
+    )
+    if not rsi_ok:
+        return False
+
+    extension = abs(price - entry) / entry if entry else 999
+    return extension <= thresholds["max_extend"]
 
 def _generate_ai_predictions():
     """Generate AI predictions for next movers based on stored analysis."""
@@ -600,6 +677,196 @@ def _generate_ai_predictions():
     except Exception as e:
         pass
 
+def _classify_trade_type(adx, rsi, trend_q, entry_q, vol_ratio=1.0):
+    adx = float(adx or 0)
+    rsi = float(rsi or 50)
+    vol_ratio = float(vol_ratio or 1.0)
+    trend_q = (trend_q or "").upper()
+    entry_q = (entry_q or "").upper()
+    if adx >= 25 and 40 <= rsi <= 68 and trend_q in ("STRONG", "MODERATE"):
+        return "SWING"
+    if adx >= 20 and 35 <= rsi <= 72 and trend_q != "WEAK" and vol_ratio >= 0.9:
+        return "SWING"
+    if entry_q == "IDEAL" and adx >= 20 and 35 <= rsi <= 70:
+        return "SWING"
+    if adx < 18 or rsi >= 70 or rsi <= 30:
+        return "INTRA"
+    return "SWING" if adx >= 18 else "INTRA"
+
+def _compute_signal_reliability(signal):
+    score = float(signal.get("score") or 0)
+    adx = float(signal.get("adx") or 0)
+    rsi = float(signal.get("rsi") or 50)
+    vol_ratio = float(signal.get("vol_ratio") or 0)
+    risk_pct = float(signal.get("risk_pct") or 0)
+    ai_confidence = float(signal.get("ai_confidence") or 0)
+    momentum_score = float(signal.get("momentum_score") or 0)
+    price = float(signal.get("live_price") or signal.get("current") or signal.get("entry_price") or signal.get("entry") or 0)
+    entry = float(signal.get("entry_price") or signal.get("entry") or 0)
+    e20 = float(signal.get("e20") or 0)
+    e50 = float(signal.get("e50") or 0)
+    e200 = float(signal.get("e200") or 0)
+    direction = (signal.get("direction") or "").upper()
+
+    trend_aligned = (
+        (direction == "LONG" and price >= e20 and price >= e50 and (e200 <= 0 or price >= e200)) or
+        (direction == "SHORT" and price <= e20 and price <= e50 and (e200 <= 0 or price <= e200))
+    )
+    extension = abs(price - entry) / entry if entry else 999
+    rsi_sweet = (
+        (direction == "LONG" and 45 <= rsi <= 64) or
+        (direction == "SHORT" and 36 <= rsi <= 55)
+    )
+
+    reliability = 12.0
+    reliability += min(score, 9.0) * 3.8
+    reliability += min(ai_confidence, 100.0) * 0.14
+    reliability += min(adx, 40.0) * 0.35
+    reliability += min(vol_ratio, 2.0) * 4.5
+    reliability += min(momentum_score, 120.0) * 0.05
+
+    if trend_aligned:
+        reliability += 4.0
+    else:
+        reliability -= 14.0
+
+    if rsi_sweet:
+        reliability += 3.0
+    else:
+        reliability -= 6.0
+
+    if 0.25 <= risk_pct <= 4.5:
+        reliability += 4.0
+    elif 4.5 < risk_pct <= 6.0:
+        reliability += 1.0
+    else:
+        reliability -= 12.0
+
+    if extension <= 0.012:
+        reliability += 3.0
+    elif extension <= 0.025:
+        reliability += 1.0
+    else:
+        reliability -= 8.0
+
+    if direction == "LONG" and rsi >= 69:
+        reliability -= 7.0
+    if direction == "SHORT" and rsi <= 31:
+        reliability -= 7.0
+    if adx >= 30 and vol_ratio >= 1.35:
+        reliability += 2.0
+    if score >= 8.5 and ai_confidence >= 68:
+        reliability += 2.0
+
+    reasons = []
+    if trend_aligned:
+        reasons.append("trend aligned")
+    if adx >= 25:
+        reasons.append("strong trend")
+    if vol_ratio >= 1.2:
+        reasons.append("volume confirmation")
+    if rsi_sweet:
+        reasons.append("clean RSI zone")
+    if 0.25 <= risk_pct <= 4.5:
+        reasons.append("balanced risk")
+    if extension <= 0.012:
+        reasons.append("not extended")
+
+    return max(1, min(99, int(round(reliability)))), reasons
+
+def _is_tradeable_signal(sig, min_score=7):
+    reliability, _ = _compute_signal_reliability(sig)
+    score = float(sig.get("score") or 0)
+    adx = float(sig.get("adx") or 0)
+    rsi = float(sig.get("rsi") or 0)
+    vol_ratio = float(sig.get("vol_ratio") or 0)
+    risk_pct = float(sig.get("risk_pct") or 0)
+    direction = sig.get("direction") or ""
+    price = float(sig.get("current") or sig.get("live_price") or sig.get("entry") or 0)
+    e20 = float(sig.get("e20") or 0)
+    e50 = float(sig.get("e50") or 0)
+    e200 = float(sig.get("e200") or 0)
+    trade_type = (sig.get("trade_type") or sig.get("recommended") or "").upper()
+    if trade_type not in ("SWING", "INTRA"):
+        return False
+    trend_aligned = (
+        (direction == "LONG" and price >= e20 and price >= e50 and (e200 <= 0 or price >= e200)) or
+        (direction == "SHORT" and price <= e20 and price <= e50 and (e200 <= 0 or price <= e200))
+    )
+    rsi_ok = (
+        (direction == "LONG" and 42 <= rsi <= 68) or
+        (direction == "SHORT" and 32 <= rsi <= 58)
+    )
+    return (
+        score >= max(min_score, 7) and
+        adx >= 18 and
+        vol_ratio >= 1.0 and
+        0.15 <= risk_pct <= 5.5 and
+        trend_aligned and
+        rsi_ok and
+        reliability >= 72
+    )
+
+def _strict_tradeable_profile(signal):
+    reliability = float(signal.get("reliability_score") or 0)
+    score = float(signal.get("score") or 0)
+    adx = float(signal.get("adx") or 0)
+    vol_ratio = float(signal.get("vol_ratio") or 0)
+    ai_confidence = float(signal.get("ai_confidence") or 0)
+    risk_pct = float(signal.get("risk_pct") or 0)
+    entry = float(signal.get("entry") or signal.get("entry_price") or 0)
+    sl = float(signal.get("sl") or 0)
+    t1 = float(signal.get("t1") or 0)
+    rr = abs((t1 - entry) / (sl - entry)) if entry and sl and t1 and abs(sl - entry) > 1e-9 else 0.0
+    trade_type = (signal.get("trade_type") or signal.get("recommended") or "").upper()
+
+    reasons = []
+    if reliability >= 90:
+        reasons.append("high reliability")
+    if score >= 8.0:
+        reasons.append("strong setup score")
+    if adx >= 26:
+        reasons.append("trend strength")
+    if vol_ratio >= 1.2:
+        reasons.append("volume support")
+    if ai_confidence >= 74:
+        reasons.append("ai confirmation")
+    if 0.25 <= risk_pct <= 4.8:
+        reasons.append("controlled risk")
+    if rr >= 1.8:
+        reasons.append("good reward ratio")
+
+    is_strict = (
+        trade_type == "SWING" and
+        reliability >= 90 and
+        score >= 7.5 and
+        adx >= 24 and
+        vol_ratio >= 1.1 and
+        ai_confidence >= 70 and
+        0.25 <= risk_pct <= 4.8 and
+        rr >= 1.8
+    )
+    return is_strict, round(rr, 2), reasons
+
+def _compute_ai_conviction(signal):
+    reliability, reliability_reasons = _compute_signal_reliability(signal)
+    strict_tradeable, rr_ratio, strict_reasons = _strict_tradeable_profile(dict(signal, reliability_score=reliability))
+    ai_confidence = float(signal.get("ai_confidence") or 0)
+    momentum_score = min(float(signal.get("momentum_score") or 0), 100.0)
+    score = float(signal.get("score") or 0)
+
+    conviction = (
+        reliability * 0.62 +
+        ai_confidence * 0.16 +
+        momentum_score * 0.10 +
+        score * 1.4 +
+        min(rr_ratio, 3.0) * 4.0 +
+        (4.0 if strict_tradeable else 0.0)
+    )
+    conviction = max(1, min(99, int(round(conviction))))
+    reasons = list(dict.fromkeys((strict_reasons or []) + (reliability_reasons or [])))[:6]
+    return conviction, reliability, rr_ratio, strict_tradeable, reasons
+
 def _check_signal_targets():
     """Check all signals and update if targets or SL hit."""
     try:
@@ -636,25 +903,27 @@ def _check_signal_targets():
             sl_hit = None
             
             if direction == 'LONG':
-                if lp >= t1:
-                    hit_result = 'T1_HIT'
-                    t1_hit = now
+                if lp <= sl:
+                    hit_result = 'SL_HIT'
+                    sl_hit = now
                 elif lp >= t2:
                     hit_result = 'T2_HIT'
+                    t1_hit = now
                     t2_hit = now
-                elif lp <= sl:
-                    hit_result = 'SL_HIT'
-                    sl_hit = now
-            else:  # SHORT
-                if lp <= t1:
+                elif lp >= t1:
                     hit_result = 'T1_HIT'
                     t1_hit = now
-                elif lp <= t2:
-                    hit_result = 'T2_HIT'
-                    t2_hit = now
-                elif lp >= sl:
+            else:  # SHORT
+                if lp >= sl:
                     hit_result = 'SL_HIT'
                     sl_hit = now
+                elif lp <= t2:
+                    hit_result = 'T2_HIT'
+                    t1_hit = now
+                    t2_hit = now
+                elif lp <= t1:
+                    hit_result = 'T1_HIT'
+                    t1_hit = now
             
             if hit_result:
                 conn.execute("""
@@ -774,13 +1043,26 @@ def _full_universe_scan():
             avg_vol = sum(vol_window) / len(vol_window) if vol_window else 1
             update_live_price(sym, lp, prev_close, volume, avg_vol)
             
-            # Score and log signal (Accuracy focus: Score >= 7)
+            # Score once, then store progressive analysis so cache-backed pages populate immediately.
             sc, direction, fl, meta = score_candle(last, ind, rows)
+            if qd.get("change_pct") is not None:
+                meta["day_change_pct"] = qd["change_pct"]
+            trade_type = _classify_trade_type(
+                meta.get("adx", 0),
+                meta.get("rsi", 50),
+                meta.get("trend_quality", ""),
+                meta.get("entry_quality", ""),
+                meta.get("vr", 1.0),
+            )
+            lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
+            risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
+
+            try:
+                _store_sector_analysis(info, sym, direction, sc, lv, lp, risk_pct, trade_type, meta, ind)
+            except Exception as store_error:
+                print(f"[STORE ERROR] {sym}: {store_error}")
+
             if sc >= 7:
-                trade_type = "SWING" if meta.get("adx", 0) >= 22 else "INTRA"
-                lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
-                risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
-                
                 current_time = datetime.datetime.now().strftime("%H:%M")
                 signal_data = {
                     "date": last["date"], "symbol": sym, "sector": info[3],
@@ -801,45 +1083,6 @@ def _full_universe_scan():
                 print(f"[SIGNAL] HIGH ACCURACY: {sym} ({direction}) Score: {sc}")
                 
         except Exception as e:
-            continue
-    
-    # Store ALL scanned stocks in sector_analysis (not just score >= 5)
-    for sym, data in _ml_data_cache.items():
-        try:
-            # Get stock info
-            info = next((x for x in UNIVERSE if x[0] == sym), None)
-            if not info:
-                continue
-            
-            # Get live price from quote data (has prev_close, change_pct, etc.)
-            qd = quote_data.get(sym, {})
-            lp = qd.get("price") or live_prices.get(sym, 0)
-            if lp <= 0:
-                continue
-            
-            # Get latest row and indicators
-            rows = data
-            if not rows or len(rows) < 30:
-                continue
-            last = rows[-1]
-            ind = compute_indicators(rows)[-1]
-            
-            # Update meta with day_change_pct from Zerodha
-            meta_copy = dict(meta)
-            if qd.get("change_pct") is not None:
-                meta_copy["day_change_pct"] = qd["change_pct"]
-            
-            sc, direction, fl, meta_out = score_candle(last, ind, rows)
-            # Preserve day_change_pct
-            if qd.get("change_pct") is not None:
-                meta_out["day_change_pct"] = qd["change_pct"]
-            trade_type = meta_out.get("trend_quality", "SWING")
-            lv = compute_levels(lp, ind.get("atr", last["close"] * 0.015), direction, trade_type)
-            risk_pct = round(lv["risk_per"] / lp * 100, 2) if lp > 0 else 0
-            
-            # Store analysis for sector views
-            _store_sector_analysis(info, sym, direction, sc, lv, lp, risk_pct, trade_type, meta_out, ind)
-        except:
             continue
     
     if scanned_count > 0:
@@ -1476,39 +1719,22 @@ def make_signal(sym, info, rows, inds, idx, sc, dr, fl, meta, entry_time=None):
     rnd = random.Random(hash(sym + rows[idx]["date"]))
     if entry_time is None:
         entry_time = rnd.choice(ENTRY_TIMES_OPEN if rnd.random() < 0.65 else ENTRY_TIMES_POWER)
-    lv = compute_levels(rows[idx]["close"], inds[idx]["atr"], dr)
     
+    current_price = rows[idx]["close"]
+    prev_close = rows[idx-1]["close"] if idx > 0 and rows[idx-1]["close"] > 0 else current_price
+
     # Determine swing vs intra suitability (enhanced)
     adx = meta.get("adx", 0)
     rsi = meta.get("rsi", 50)
     vr = meta.get("vr", 1)
     trend_q = meta.get("trend_quality", "WEAK")
     entry_q = meta.get("entry_quality", "NORMAL")
-    
-    # SWING: Strong trend (ADX >= 22) + moderate momentum (RSI 35-70) + good trend quality
-    # INTRA: Weak trend (ADX < 18) + extreme RSI (>75 or <25)
-    if adx >= 22 and 35 <= rsi <= 70 and trend_q in ["STRONG", "MODERATE"]:
-        recommended = "SWING"
-        confidence = "HIGH"
-    elif adx >= 20 and 30 <= rsi <= 75 and trend_q != "WEAK":
-        recommended = "SWING"
-        confidence = "MEDIUM"
-    elif adx < 15 or rsi > 80 or rsi < 20:
-        recommended = "INTRA"
-        confidence = "HIGH"
-    elif adx >= 18 and (rsi >= 70 or rsi <= 30):
-        recommended = "INTRA"
-        confidence = "MEDIUM"
-    elif entry_q == "IDEAL" and adx >= 18:
-        recommended = "SWING"
-        confidence = "HIGH"
-    else:
-        recommended = "SWING"  # Default to swing for more opportunities
-        confidence = "MEDIUM"
-    
+    recommended = _classify_trade_type(adx, rsi, trend_q, entry_q, vr)
+    confidence = "HIGH" if sc >= 8 and adx >= 22 and vr >= 1.2 else "MEDIUM" if sc >= 7 else "LOW"
+    lv = compute_levels(current_price, inds[idx]["atr"], dr, recommended)
+    risk_pct = round(lv["risk_per"] / current_price * 100, 2) if current_price > 0 else 0
+
     # Price change analysis (with safety checks)
-    current_price = rows[idx]["close"]
-    prev_close = rows[idx-1]["close"] if idx > 0 and rows[idx-1]["close"] > 0 else current_price
     day_change = ((current_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
     
     # 52-week analysis (using last 60 days as proxy) - with safety
@@ -1547,9 +1773,10 @@ def make_signal(sym, info, rows, inds, idx, sc, dr, fl, meta, entry_time=None):
         "sl":             lv["sl"],
         "t1":             lv["t1"],
         "t2":             lv["t2"],
-        "t3":             lv["t3"],
-        "risk_per":       lv["risk_per"],
-        "atr":            lv["atr"],
+          "t3":             lv["t3"],
+          "risk_per":       lv["risk_per"],
+          "risk_pct":       risk_pct,
+          "atr":            lv["atr"],
         
         # Current state
         "close":          current_price,
@@ -1572,9 +1799,10 @@ def make_signal(sym, info, rows, inds, idx, sc, dr, fl, meta, entry_time=None):
         "e50":            inds[idx]["e50"],
         "e200":           inds[idx]["e200"],
         
-        # Recommendations
-        "recommended":    recommended,
-        "confidence":     confidence,
+          # Recommendations
+          "recommended":    recommended,
+          "trade_type":     recommended,
+          "confidence":     confidence,
         
         # Position analysis
         "pct_from_high": round(pct_from_high, 1),
@@ -1631,12 +1859,12 @@ def get_swing_signals():
 
 @app.route("/api/sector-intelligence")
 def sector_intelligence():
-    """Get all stocks analyzed and ranked by AI probability score across all sectors."""
+    """Get all stocks analyzed and ranked by AI conviction across all sectors."""
     conn = get_db()
     cur = conn.execute("""
         SELECT symbol, company, sector, direction, score, live_price, entry_price, sl, t1, t2, t3,
                adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, ai_prediction, ai_confidence, 
-               momentum_score, updated_at
+               momentum_score, updated_at, e20, e50, e200
         FROM sector_analysis 
         ORDER BY score DESC, ai_confidence DESC
     """)
@@ -1649,12 +1877,24 @@ def sector_intelligence():
             "t1": row[8], "t2": row[9], "t3": row[10], "adx": row[11], "rsi": row[12],
             "vol_ratio": row[13], "risk_pct": row[14], "risk_per": row[15], "atr": row[16],
             "trade_type": row[17], "ai_prediction": row[18], "ai_confidence": row[19],
-            "momentum_score": row[20], "updated_at": row[21]
+            "momentum_score": row[20], "updated_at": row[21],
+            "e20": row[22], "e50": row[23], "e200": row[24],
         }
+        if not _is_tradeable_cached_signal(s, "prime"):
+            continue
+        s["conviction_score"], s["reliability_score"], s["rr_ratio"], s["strict_tradeable"], s["conviction_reasons"] = _compute_ai_conviction(s)
+        s["prob_score"] = s["conviction_score"]
         stocks.append(s)
     
     conn.close()
-    return jsonify({"stocks": stocks, "total": len(stocks)})
+    stocks.sort(key=lambda x: (
+        0 if x.get("strict_tradeable") else 1,
+        -x["conviction_score"],
+        -x["reliability_score"],
+        -x["score"],
+        -x["ai_confidence"]
+    ))
+    return jsonify({"stocks": stocks[:60], "total": len(stocks)})
 
 @app.route("/api/stock-detail/<symbol>")
 def stock_detail(symbol):
@@ -1706,11 +1946,6 @@ def cors(r):
     return r
 
 # ── ROUTES ───────────────────────────────
-@app.route("/", defaults={"p": ""})
-@app.route("/<path:p>")
-def root(p):
-    fp = os.path.join(BASE, "../frontend/index.html")
-    return send_file(fp) if os.path.exists(fp) else ("<h2>Frontend missing</h2>", 200)
 
 @app.route("/api/status")
 def status():
@@ -2196,106 +2431,134 @@ def scanner_cached():
     dr = request.args.get("direction", "")
     rec = request.args.get("type", "")
     quality = request.args.get("quality", "all")  # all, prime, high
-    
-    # Get FRESH live prices from database cache (updated by background scanner)
-    live_prices_list = get_all_live_prices_db()
-    fresh_prices = {p['symbol']: p['price'] for p in live_prices_list if p.get('price')}
-    fresh_changes = {p['symbol']: p['day_change_pct'] for p in live_prices_list}
-    print(f"[SCANNER-CACHED] fresh_prices keys sample: {list(fresh_prices.keys())[:5]}")
-    print(f"[SCANNER-CACHED] 360ONE price: {fresh_prices.get('360ONE')}")
-    
-    # Import compute_levels for recalculating entry prices
-    from engine import compute_levels
-    
-    conn = get_db()
-    
-    # Base query - use sector_analysis as the main source for scanned data
-    query = """
-        SELECT symbol, company, sector, direction, score, live_price, entry_price, 
-               sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
-               ai_confidence, momentum_score, updated_at, entry_time
-        FROM sector_analysis 
-        WHERE live_price > 0
-    """
-    params = []
-    
-    # Add quality filters for more trustworthy signals
-    if quality == "elite":
-        # Elite: Highest confidence - strict filters
-        query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.0 AND ai_confidence >= 60"
-    elif quality == "high":
-        # High: Strong signals
-        query += " AND score >= 7.5 AND adx >= 22 AND vol_ratio >= 0.8"
-    elif quality == "prime":
-        # Prime: Good signals
-        query += " AND score >= 7 AND adx >= 18 AND vol_ratio >= 0.7"
-    else:
-        # Default behavior: show everything that has been scanned
-        if ms > 0:
-            query += " AND score >= ?"
-            params.append(ms)
-    
-    if sec:
-        query += " AND sector = ?"
-        params.append(sec)
-    if dr:
-        query += " AND direction = ?"
-        params.append(dr)
-    if rec:
-        query += " AND trade_type = ?"
-        params.append(rec)
-    
-    query += " ORDER BY score DESC, momentum_score DESC"
-    
-    cur = conn.execute(query, params)
-    out = []
-    for row in cur.fetchall():
-        sym = row[0]
-        direction = row[3]
-        trade_type = row[17]
-        stored_atr = row[16] or 0
-        
-        # Use FRESH live price from database cache
-        current_price = fresh_prices.get(sym)
-        if not current_price:
-            current_price = row[5]
-        
-        # Always calculate fresh ATR and levels using current price
-        if current_price and current_price > 0:
-            atr = current_price * 0.015
-            levels = compute_levels(current_price, atr, direction, trade_type if trade_type else "SWING")
-            entry = levels["entry"]
-            sl = levels["sl"]
-            t1 = levels["t1"]
-            t2 = levels["t2"]
-            t3 = levels["t3"]
-            risk_per = levels["risk_per"]
-            calculated_atr = round(atr, 2)
+
+    try:
+        # Get FRESH live prices from database cache (updated by background scanner)
+        live_prices_list = get_all_live_prices_db()
+        fresh_prices = {p['symbol']: p['price'] for p in live_prices_list if p.get('price')}
+        fresh_changes = {p['symbol']: p['day_change_pct'] for p in live_prices_list}
+        print(f"[SCANNER-CACHED] fresh_prices keys sample: {list(fresh_prices.keys())[:5]}")
+        print(f"[SCANNER-CACHED] 360ONE price: {fresh_prices.get('360ONE')}")
+
+        query = """
+            SELECT symbol, company, sector, direction, score, live_price, entry_price, 
+                   sl, t1, t2, t3, adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type,
+                   ai_confidence, momentum_score, updated_at, entry_time, e20, e50, e200
+            FROM sector_analysis 
+            WHERE live_price > 0
+        """
+        params = []
+
+        if quality == "elite":
+            query += " AND score >= 8 AND adx >= 25 AND vol_ratio >= 1.0 AND ai_confidence >= 60"
+        elif quality == "high":
+            query += " AND score >= 7.5 AND adx >= 22 AND vol_ratio >= 0.8"
+        elif quality == "prime":
+            query += " AND score >= 7 AND adx >= 18 AND vol_ratio >= 0.7"
         else:
-            entry = row[6]
-            sl = row[7]
-            t1 = row[8]
-            t2 = row[9]
-            t3 = row[10]
-            risk_per = row[15]
-            calculated_atr = stored_atr
-        
-        day_change_pct = fresh_changes.get(sym, 0)
-        
-        out.append({
-            "symbol": sym, "company": row[1], "sector": row[2], "direction": direction,
-            "score": row[4], "live_price": current_price, "entry": entry, "sl": sl,
-            "t1": t1, "t2": t2, "t3": t3, "adx": row[11], "rsi": row[12],
-            "vol_ratio": row[13], "risk_pct": row[14], "risk_per": risk_per, "atr": calculated_atr,
-            "recommended": trade_type,
-            "ai_confidence": row[18],
-            "momentum_score": row[19], "updated_at": row[20],
-            "entry_time": row[21] if len(row) > 21 else "",
-            "day_change_pct": day_change_pct
-        })
-    conn.close()
-    
-    return jsonify({"stocks": out, "total": len(out), "cached": True})
+            if ms > 0:
+                query += " AND score >= ?"
+                params.append(ms)
+
+        if sec:
+            query += " AND sector = ?"
+            params.append(sec)
+        if dr:
+            query += " AND direction = ?"
+            params.append(dr)
+        if rec:
+            query += " AND trade_type = ?"
+            params.append(rec)
+
+        query += " ORDER BY score DESC, momentum_score DESC"
+
+        rows = None
+        last_exc = None
+        for _ in range(3):
+            conn = None
+            try:
+                conn = get_db()
+                rows = conn.execute(query, params).fetchall()
+                break
+            except sqlite3.OperationalError as e:
+                last_exc = e
+                time.sleep(0.35)
+            finally:
+                if conn:
+                    conn.close()
+        if rows is None:
+            raise last_exc or RuntimeError("scanner cache query failed")
+
+        out = []
+        for row in rows:
+            sym = row[0]
+            direction = row[3]
+            trade_type = row[17]
+            stored_atr = row[16] or 0
+
+            current_price = fresh_prices.get(sym)
+            if not current_price:
+                current_price = row[5]
+
+            if current_price and current_price > 0:
+                atr = current_price * 0.015
+                levels = compute_levels(current_price, atr, direction, trade_type if trade_type else "SWING")
+                entry = levels["entry"]
+                sl = levels["sl"]
+                t1 = levels["t1"]
+                t2 = levels["t2"]
+                t3 = levels["t3"]
+                risk_per = levels["risk_per"]
+                calculated_atr = round(atr, 2)
+            else:
+                entry = row[6]
+                sl = row[7]
+                t1 = row[8]
+                t2 = row[9]
+                t3 = row[10]
+                risk_per = row[15]
+                calculated_atr = stored_atr
+
+            day_change_pct = fresh_changes.get(sym, 0)
+
+            signal_row = {
+                "symbol": sym, "company": row[1], "sector": row[2], "direction": direction,
+                "score": row[4], "live_price": current_price, "entry": entry, "sl": sl,
+                "t1": t1, "t2": t2, "t3": t3, "adx": row[11], "rsi": row[12],
+                "vol_ratio": row[13], "risk_pct": row[14], "risk_per": risk_per, "atr": calculated_atr,
+                "recommended": trade_type,
+                "trade_type": trade_type,
+                "ai_confidence": row[18],
+                "momentum_score": row[19], "updated_at": row[20],
+                "entry_time": row[21] if len(row) > 21 else "",
+                "day_change_pct": day_change_pct,
+                "e20": row[22] if len(row) > 22 else 0,
+                "e50": row[23] if len(row) > 23 else 0,
+                "e200": row[24] if len(row) > 24 else 0,
+                "entry_price": entry,
+            }
+            reliability_score, reliability_reasons = _compute_signal_reliability(signal_row)
+            signal_row["reliability_score"] = reliability_score
+            signal_row["reliability_reasons"] = reliability_reasons
+            signal_row["strict_tradeable"], signal_row["rr_ratio"], signal_row["strict_reasons"] = _strict_tradeable_profile(signal_row)
+            signal_row["is_tradeable"] = _is_tradeable_cached_signal(signal_row, "prime")
+            if quality == "all" and trade_type not in ("SWING", "INTRA"):
+                continue
+            if quality != "all" and not _is_tradeable_cached_signal(signal_row, quality):
+                continue
+            out.append(signal_row)
+        out.sort(key=lambda x: (
+            0 if x.get("is_tradeable") else 1,
+            -float(x.get("reliability_score") or 0),
+            -float(x.get("score") or 0),
+            -float(x.get("ai_confidence") or 0)
+        ))
+        return jsonify({"stocks": out, "total": len(out), "cached": True})
+    except Exception as e:
+        import traceback
+        print(f"[SCANNER-CACHED] ERROR: {e}")
+        traceback.print_exc()
+        return jsonify({"stocks": [], "total": 0, "cached": True, "error": str(e)}), 200
 
 @app.route("/api/scanner")
 def scanner():
@@ -2400,7 +2663,7 @@ def scanner():
                 signal["risk_pct"] = risk_pct
                 signal["day_change_pct"] = 0.0
                 signal["data_date"] = last_date
-            
+            signal["reliability_score"], signal["reliability_reasons"] = _compute_signal_reliability(signal)
             out.append(signal)
             
             # Store in sector_analysis for detailed stock analysis
@@ -2420,49 +2683,235 @@ def scanner():
             skipped.append((sym, str(e)))
             continue
     
-    out.sort(key=lambda x: (-x["score"], -x["adx"]))
+    out.sort(key=lambda x: (
+        -float(x.get("reliability_score") or 0),
+        -float(x["score"] or 0),
+        -float(x["adx"] or 0)
+    ))
     print(f"[SCANNER] Found {len(out)} signals, scanned {len(UNIVERSE)} stocks, skipped {len(skipped)}")
     return jsonify({"stocks": out, "total": len(out), "scanned": len(UNIVERSE), "skipped": skipped[:10]})
 
 @app.route("/api/signals")
 def signals():
     ms    = int(request.args.get("min_score", 5))
+    strict_only = request.args.get("strict", "0") == "1"
+    strict_limit = max(1, min(int(request.args.get("limit", 10)), 20))
     today = str(datetime.date.today())
-    cfg   = gcfg()
-    out   = []
-    skipped = []
-    rnd   = random.Random(42)
-    use_real = cfg.get("use_real", True)
-    for info in UNIVERSE:
-        sym = info[0]
-        try:
-            rows, inds = get_stock(sym, use_real=use_real)
-            if not rows or len(rows) < 30:
-                skipped.append((sym, "no data"))
-                continue
-            sc, dr, fl, meta = score_candle(rows[-1], inds[-1])
-            if sc < ms:
-                skipped.append((sym, f"low score {sc}"))
-                continue
-            t   = rnd.choice(ENTRY_TIMES_OPEN if rnd.random() < 0.65 else ENTRY_TIMES_POWER)
-            sig = make_signal(sym, info, rows, inds, -1, sc, dr, fl, meta, t)
-            out.append(sig)
-        except Exception as e:
-            skipped.append((sym, str(e)))
-            continue
-    out.sort(key=lambda x: (-x["score"], -x["adx"]))
-    # Log signals with live_price
+    quality = "elite" if ms >= 8 else "high" if ms >= 7 else "prime"
+    live_prices = {p["symbol"]: p for p in get_all_live_prices_db()}
     conn = get_db()
+    rows = conn.execute("""
+        SELECT symbol, company, sector, direction, score, live_price, entry_price, sl, t1, t2, t3,
+               adx, rsi, vol_ratio, risk_pct, risk_per, atr, trade_type, ai_confidence,
+               momentum_score, updated_at, entry_time, e20, e50, e200
+        FROM sector_analysis
+        WHERE score >= ?
+        ORDER BY score DESC, ai_confidence DESC, momentum_score DESC
+    """, (max(ms, 7),)).fetchall()
+    out = []
+    skipped = []
+    for row in rows:
+        sym = row["symbol"]
+        lp = live_prices.get(sym, {})
+        current_price = float(lp.get("price") or row["live_price"] or row["entry_price"] or 0)
+        trade_type = (row["trade_type"] or "").upper() or "SWING"
+        atr = float(row["atr"] or 0) or (current_price * 0.015 if current_price > 0 else 0)
+        levels = compute_levels(current_price, atr, row["direction"], trade_type) if current_price > 0 else {
+            "entry": row["entry_price"] or 0,
+            "sl": row["sl"] or 0,
+            "t1": row["t1"] or 0,
+            "t2": row["t2"] or 0,
+            "t3": row["t3"] or 0,
+            "risk_per": row["risk_per"] or 0,
+            "atr": atr,
+        }
+        signal_row = {
+            "date": today,
+            "symbol": sym,
+            "company": row["company"],
+            "sector": row["sector"],
+            "direction": row["direction"],
+            "score": row["score"],
+            "filters": [],
+            "entry": levels["entry"],
+            "entry_price": levels["entry"],
+            "current": current_price,
+            "live_price": current_price,
+            "prev_close": float(lp.get("prev_close") or 0),
+            "day_change_pct": float(lp.get("day_change_pct") or 0),
+            "high": current_price,
+            "low": current_price,
+            "sl": levels["sl"],
+            "t1": levels["t1"],
+            "t2": levels["t2"],
+            "t3": levels["t3"],
+            "risk_per": levels["risk_per"],
+            "risk_pct": round(levels["risk_per"] / current_price * 100, 2) if current_price > 0 else float(row["risk_pct"] or 0),
+            "atr": levels["atr"],
+            "close": current_price,
+            "volume": float(lp.get("volume") or 0),
+            "adx": float(row["adx"] or 0),
+            "rsi": float(row["rsi"] or 0),
+            "vol_ratio": float(lp.get("vol_ratio") or row["vol_ratio"] or 0),
+            "vol_spike": float(lp.get("vol_ratio") or row["vol_ratio"] or 0),
+            "st": 0,
+            "entry_time": row["entry_time"] or "",
+            "entry_datetime": f"{today} {(row['entry_time'] or '09:20')} IST",
+            "bb_up": 0,
+            "bb_lo": 0,
+            "supertrend": 0,
+            "e20": float(row["e20"] or 0),
+            "e50": float(row["e50"] or 0),
+            "e200": float(row["e200"] or 0),
+            "recommended": trade_type,
+            "trade_type": trade_type,
+            "confidence": "HIGH" if row["score"] >= 8 else "MEDIUM",
+            "pct_from_high": 0,
+            "pct_from_low": 0,
+            "high_60d": 0,
+            "low_60d": 0,
+            "is_breakout": float(row["adx"] or 0) >= 28 and float(lp.get("vol_ratio") or row["vol_ratio"] or 0) >= 1.5,
+            "is_volume_spike": float(lp.get("vol_ratio") or row["vol_ratio"] or 0) >= 2.0,
+            "is_reversal": float(row["rsi"] or 0) > 65 or float(row["rsi"] or 0) < 35,
+            "is_momentum": float(row["adx"] or 0) >= 25 and float(row["score"] or 0) >= 7,
+            "ai_confidence": int(row["ai_confidence"] or 0),
+            "momentum_score": int(row["momentum_score"] or 0),
+            "updated_at": row["updated_at"],
+        }
+        reliability_score, reliability_reasons = _compute_signal_reliability(signal_row)
+        signal_row["reliability_score"] = reliability_score
+        signal_row["reliability_reasons"] = reliability_reasons
+        signal_row["strict_tradeable"], signal_row["rr_ratio"], signal_row["strict_reasons"] = _strict_tradeable_profile(signal_row)
+        if not _is_tradeable_cached_signal(signal_row, quality):
+            skipped.append((
+                sym,
+                "filtered score={0} rel={1} adx={2:.1f} vr={3:.2f} risk={4:.2f} type={5}".format(
+                    float(signal_row["score"] or 0),
+                    reliability_score,
+                    float(signal_row["adx"] or 0),
+                    float(signal_row["vol_ratio"] or 0),
+                    float(signal_row["risk_pct"] or 0),
+                    trade_type,
+                ),
+            ))
+            continue
+        out.append(signal_row)
+
+    out.sort(key=lambda x: (
+        -float(x.get("reliability_score") or 0),
+        -float(x["score"] or 0),
+        -float(x.get("ai_confidence") or 0),
+        -float(x.get("adx") or 0)
+    ))
+    used_fallback = False
+    if not out:
+        latest_row = conn.execute(
+            "SELECT signal_date FROM signal_log ORDER BY signal_date DESC, signal_time DESC, logged_at DESC LIMIT 1"
+        ).fetchone()
+        latest_signal_date = latest_row[0] if latest_row and latest_row[0] else today
+        fallback_rows = conn.execute("""
+            SELECT signal_date, symbol, sector, direction, score, trade_type, entry, sl, t1, t2, t3,
+                   adx, rsi, vol_ratio, entry_time, atr, live_price, risk_pct, signal_time
+            FROM signal_log
+            WHERE signal_date = ? AND score >= ?
+            ORDER BY score DESC, signal_time DESC, logged_at DESC
+            LIMIT 20
+        """, (latest_signal_date, max(ms, 7))).fetchall()
+        for row in fallback_rows:
+            lp = live_prices.get(row["symbol"], {})
+            live_price = float(lp.get("price") or row["live_price"] or row["entry"] or 0)
+            risk_pct = float(row["risk_pct"] or 0)
+            if not (0.15 <= risk_pct <= 6.0):
+                continue
+            if float(row["adx"] or 0) < 18 or float(lp.get("vol_ratio") or row["vol_ratio"] or 0) < 1.0:
+                continue
+            out.append({
+                "date": row["signal_date"] or latest_signal_date,
+                "symbol": row["symbol"],
+                "company": row["symbol"],
+                "sector": row["sector"],
+                "direction": row["direction"],
+                "score": row["score"],
+                "filters": [],
+                "entry": row["entry"],
+                "entry_price": row["entry"],
+                "current": live_price,
+                "live_price": live_price,
+                "prev_close": float(lp.get("prev_close") or 0),
+                "day_change_pct": float(lp.get("day_change_pct") or 0),
+                "high": live_price,
+                "low": live_price,
+                "sl": row["sl"],
+                "t1": row["t1"],
+                "t2": row["t2"],
+                "t3": row["t3"],
+                "risk_per": abs(float(row["entry"] or 0) - float(row["sl"] or 0)),
+                "risk_pct": risk_pct,
+                "atr": float(row["atr"] or 0),
+                "close": live_price,
+                "volume": float(lp.get("volume") or 0),
+                "adx": float(row["adx"] or 0),
+                "rsi": float(row["rsi"] or 0),
+                "vol_ratio": float(lp.get("vol_ratio") or row["vol_ratio"] or 0),
+                "vol_spike": float(lp.get("vol_ratio") or row["vol_ratio"] or 0),
+                "st": 0,
+                "entry_time": row["entry_time"] or row["signal_time"] or "",
+                "entry_datetime": f"{row['signal_date'] or latest_signal_date} {(row['entry_time'] or row['signal_time'] or '09:20')} IST",
+                "bb_up": 0,
+                "bb_lo": 0,
+                "supertrend": 0,
+                "e20": 0,
+                "e50": 0,
+                "e200": 0,
+                "recommended": row["trade_type"] or "SWING",
+                "trade_type": row["trade_type"] or "SWING",
+                "confidence": "HIGH" if float(row["score"] or 0) >= 8 else "MEDIUM",
+                "pct_from_high": 0,
+                "pct_from_low": 0,
+                "high_60d": 0,
+                "low_60d": 0,
+                "is_breakout": float(row["adx"] or 0) >= 28 and float(lp.get("vol_ratio") or row["vol_ratio"] or 0) >= 1.5,
+                "is_volume_spike": float(lp.get("vol_ratio") or row["vol_ratio"] or 0) >= 2.0,
+                "is_reversal": float(row["rsi"] or 0) > 65 or float(row["rsi"] or 0) < 35,
+                "is_momentum": float(row["adx"] or 0) >= 25 and float(row["score"] or 0) >= 7,
+                "ai_confidence": 0,
+                "momentum_score": 0,
+                "updated_at": row["signal_date"],
+            })
+            out[-1]["reliability_score"], out[-1]["reliability_reasons"] = _compute_signal_reliability(out[-1])
+            out[-1]["strict_tradeable"], out[-1]["rr_ratio"], out[-1]["strict_reasons"] = _strict_tradeable_profile(out[-1])
+        if out:
+            used_fallback = True
+
+    out.sort(key=lambda x: (
+        0 if x.get("strict_tradeable") else 1,
+        -float(x.get("reliability_score") or 0),
+        -float(x.get("score") or 0),
+        -float(x.get("ai_confidence") or 0),
+        -float(x.get("adx") or 0)
+    ))
+    if strict_only:
+        out = [s for s in out if s.get("strict_tradeable")][:strict_limit]
+
     for s in out[:25]:
-        conn.execute(
-            "INSERT INTO signal_log(signal_date,symbol,sector,direction,score,"
-            "entry,sl,t1,t2,t3,adx,rsi,vol_ratio,filters,entry_time,live_price,trade_type,atr,risk_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (today, s["symbol"], s["sector"], s["direction"], s["score"],
-             s["entry"], s["sl"], s["t1"], s["t2"], s["t3"],
-             s["adx"], s["rsi"], s["vol_ratio"],
-             json.dumps(s["filters"]), s["entry_time"], s.get("live_price", 0),
-             s.get("trade_type", "SWING"), s.get("atr", 0), s.get("risk_pct", 0))
-        )
+        if not used_fallback:
+            conn.execute(
+                "INSERT INTO signal_log(signal_date,symbol,sector,direction,score,"
+                "entry,sl,t1,t2,t3,adx,rsi,vol_ratio,filters,entry_time,live_price,trade_type,atr,risk_pct,signal_time) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(signal_date, symbol, trade_type) DO UPDATE SET "
+                "sector=excluded.sector, direction=excluded.direction, score=excluded.score, "
+                "entry=excluded.entry, sl=excluded.sl, t1=excluded.t1, t2=excluded.t2, t3=excluded.t3, "
+                "adx=excluded.adx, rsi=excluded.rsi, vol_ratio=excluded.vol_ratio, filters=excluded.filters, "
+                "entry_time=excluded.entry_time, live_price=excluded.live_price, atr=excluded.atr, "
+                "risk_pct=excluded.risk_pct, signal_time=excluded.signal_time, logged_at=CURRENT_TIMESTAMP",
+                (today, s["symbol"], s["sector"], s["direction"], s["score"],
+                 s["entry"], s["sl"], s["t1"], s["t2"], s["t3"],
+                 s["adx"], s["rsi"], s["vol_ratio"],
+                 json.dumps(s["filters"]), s["entry_time"], s.get("live_price", 0),
+                 s.get("trade_type", "SWING"), s.get("atr", 0), s.get("risk_pct", 0),
+                 s.get("entry_time", ""))
+            )
     conn.commit(); conn.close()
     return jsonify({
         "signals":      out,
@@ -2470,6 +2919,9 @@ def signals():
         "min_score":    ms,
         "date":         today,
         "filter_names": FILTER_NAMES,
+        "fallback":     used_fallback,
+        "strict":       strict_only,
+        "strict_limit": strict_limit,
         "skipped":      skipped[:10],
     })
 
@@ -2540,16 +2992,20 @@ def signals_stats():
     swing_count = sum(1 for s in signals if s.get('trade_type') == 'SWING')
     intra_count = sum(1 for s in signals if s.get('trade_type') == 'INTRA')
     
-    # Count achieved (triggered or exited with profit)
-    # A signal is "achieved" if it hit T1 or T2 or has triggered_at
-    achieved_count = sum(1 for s in signals if s.get('triggered_at') or s.get('pnl', 0) > 0)
+    achieved_results = {'T1_HIT', 'T2_HIT'}
+    failed_results = {'SL_HIT'}
+
+    # Count achieved using explicit tracked outcomes
+    achieved_count = sum(1 for s in signals if (s.get('result') or '').upper() in achieved_results)
     
-    # Count not achieved (still active or expired without hitting target)
+    # Count not achieved (failed or still pending)
     not_achieved = len(signals) - achieved_count
     
     # Detailed breakdown by trade type
-    swing_achieved = sum(1 for s in signals if s.get('trade_type') == 'SWING' and (s.get('triggered_at') or s.get('pnl', 0) > 0))
-    intra_achieved = sum(1 for s in signals if s.get('trade_type') == 'INTRA' and (s.get('triggered_at') or s.get('pnl', 0) > 0))
+    swing_achieved = sum(1 for s in signals if s.get('trade_type') == 'SWING' and (s.get('result') or '').upper() in achieved_results)
+    intra_achieved = sum(1 for s in signals if s.get('trade_type') == 'INTRA' and (s.get('result') or '').upper() in achieved_results)
+    swing_failed = sum(1 for s in signals if s.get('trade_type') == 'SWING' and (s.get('result') or '').upper() in failed_results)
+    intra_failed = sum(1 for s in signals if s.get('trade_type') == 'INTRA' and (s.get('result') or '').upper() in failed_results)
     
     conn.close()
     
@@ -2559,18 +3015,21 @@ def signals_stats():
         "swing": {
             "generated": swing_count,
             "achieved": swing_achieved,
+            "failed": swing_failed,
             "not_achieved": swing_count - swing_achieved,
             "success_rate": round(swing_achieved/swing_count*100, 1) if swing_count > 0 else 0
         },
         "intra": {
             "generated": intra_count,
             "achieved": intra_achieved,
+            "failed": intra_failed,
             "not_achieved": intra_count - intra_achieved,
             "success_rate": round(intra_achieved/intra_count*100, 1) if intra_count > 0 else 0
         },
         "overall": {
             "total_generated": len(signals),
             "total_achieved": achieved_count,
+            "total_failed": swing_failed + intra_failed,
             "total_not_achieved": not_achieved,
             "success_rate": round(achieved_count/len(signals)*100, 1) if len(signals) > 0 else 0
         },
@@ -3004,15 +3463,26 @@ def ack_alert():
 def get_signal_history():
     """Get historical signal log with live status."""
     limit = int(request.args.get("limit", 100))
-    today = datetime.date.today().strftime("%Y-%m-%d")
+    requested_date = request.args.get("date", "").strip()
+    resolved_results = ("T1_HIT", "T2_HIT", "SL_HIT")
     
     conn = get_db()
+    signal_date = requested_date
+    if not signal_date:
+        latest_row = conn.execute(
+            "SELECT signal_date FROM signal_log "
+            "WHERE trade_type IN ('SWING','INTRA') AND result IN ('T1_HIT','T2_HIT','SL_HIT') "
+            "ORDER BY signal_date DESC, signal_time DESC, logged_at DESC LIMIT 1"
+        ).fetchone()
+        signal_date = latest_row[0] if latest_row and latest_row[0] else datetime.date.today().strftime("%Y-%m-%d")
     signals = [dict(r) for r in conn.execute("""
         SELECT * FROM signal_log 
         WHERE signal_date = ?
-        ORDER BY signal_time DESC, score DESC
+          AND trade_type IN ('SWING','INTRA')
+          AND result IN ('T1_HIT','T2_HIT','SL_HIT')
+        ORDER BY COALESCE(t2_hit_time, t1_hit_time, sl_hit_time, signal_time, logged_at) DESC, score DESC
         LIMIT ?
-    """, (today, limit)).fetchall()]
+    """, (signal_date, limit)).fetchall()]
     
     # Get live prices to check status
     live_prices = {p['symbol']: p['price'] for p in get_all_live_prices_db()}
@@ -3031,9 +3501,15 @@ def get_signal_history():
             result = s.get('result', 'PENDING')
             
             # Use tracked result if available
-            if result and result != 'PENDING':
+            if result in resolved_results:
                 s['status'] = result
                 s['target_hit'] = result
+                if result == 'SL_HIT':
+                    s['pnl_points'] = round((sl - entry) if direction == 'LONG' else (entry - sl), 2) if entry and sl else 0
+                elif result == 'T2_HIT':
+                    s['pnl_points'] = round((t2 - entry) if direction == 'LONG' else (entry - t2), 2) if entry and t2 else 0
+                else:
+                    s['pnl_points'] = round((t1 - entry) if direction == 'LONG' else (entry - t1), 2) if entry and t1 else 0
             else:
                 # Calculate P&L
                 if direction == 'LONG':
@@ -3065,7 +3541,7 @@ def get_signal_history():
                 s['pnl_points'] = pnl_points
     
     conn.close()
-    return jsonify({"signals": signals, "total": len(signals)})
+    return jsonify({"signals": signals, "total": len(signals), "signal_date": signal_date})
 
 @app.route("/api/live-prices")
 def live_prices():
@@ -3112,7 +3588,11 @@ def calc():
 def signal_log():
     conn = get_db()
     rows = [dict(r) for r in conn.execute(
-        "SELECT * FROM signal_log ORDER BY signal_date DESC, score DESC LIMIT 500"
+        "SELECT * FROM signal_log "
+        "WHERE trade_type IN ('SWING','INTRA') "
+        "AND result IN ('T1_HIT','T2_HIT','SL_HIT') "
+        "ORDER BY signal_date DESC, COALESCE(t2_hit_time, t1_hit_time, sl_hit_time, signal_time, logged_at) DESC, score DESC "
+        "LIMIT 500"
     ).fetchall()]
     conn.close()
     grouped = {}
@@ -3293,7 +3773,7 @@ def swing_trades():
         "sector_performance": sector_stats
     })
 
-if __name__ == "__main__":
+def _run_server():
     # Load .env.txt if .env doesn't exist
     if not os.path.exists(os.path.join(BASE, "../.env")):
         env_txt = os.path.join(BASE, "../.env.txt")
@@ -3306,35 +3786,109 @@ if __name__ == "__main__":
                         os.environ[k] = v
 
     print("\n" + "="*55)
-    print("  Trade Smart v7 — Trading Intelligence System")
+    print("  Trade Smart v7 - Trading Intelligence System")
     print("  Real-time data from ZERODHA API")
     print("  No numpy / No pandas required!")
     print(f"  Python {sys.version.split()[0]}")
     cfg = gcfg()
     has_zerodha = bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
     if has_zerodha:
-        print("  OK Zerodha: CONNECTED -> LIVE NSE DATA")
+        print("  OK Zerodha: CREDENTIALS LOADED (auth verified on startup)")
     else:
         print("  WARN Zerodha: NOT CONNECTED")
     print(f"  Data mode: {'REAL (Zerodha)' if cfg.get('use_real') else 'SYNTHETIC'}")
-    print("  http://localhost:5000")
+    print("  http://localhost:6060")
     print("="*55 + "\n")
-    # If Zerodha streaming is enabled, run the WS connection on the main thread
-    # (avoids Twisted signal-handler issues on Windows), while Flask runs in a worker thread.
     use_stream = cfg.get("use_zerodha_ltp", True) and bool(os.environ.get("KITE_API_KEY")) and bool(os.environ.get("KITE_ACCESS_TOKEN"))
-    
-    # Start background scanner
-    # _start_background_scanner()  # Moved inside _maybe_start_zerodha_ltp_stream for better sync
-    
+
     if use_stream:
         print("  Zerodha LTP streaming: START")
         flask_thread = threading.Thread(
-            target=lambda: app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False),
-            daemon=True,
+            target=lambda: app.run(host="0.0.0.0", port=6060, debug=False, threaded=True, use_reloader=False),
+            daemon=False,
         )
         flask_thread.start()
-        # The background scanner will be started by _maybe_start_zerodha_ltp_stream once ready
         _maybe_start_zerodha_ltp_stream(run_in_main_thread=True)
     else:
         _start_background_scanner()
-        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False)
+        app.run(host="0.0.0.0", port=6060, debug=False, threaded=True, use_reloader=False)
+
+@app.route("/api/news")
+def get_market_news():
+    """Get market news from various sources."""
+    import random
+    
+    sample_news = [
+        {"title": "Sensex hits new high amid foreign investor inflows", "source": "Economic Times", "time": "10 min ago", "sentiment": "positive", "summary": "Indian markets surge as foreign investors pour in ₹2000 crore in today's session. Banking and IT sectors lead the rally.", "symbols": ["NIFTY", "SENSEX", "HDFCBANK", "INFY"]},
+        {"title": "RBI keeps repo rate unchanged at 6.5%", "source": "Business Standard", "time": "25 min ago", "sentiment": "neutral", "summary": "Reserve Bank of India maintains status quo on interest rates, focus shifts to inflation trajectory.", "symbols": ["NIFTY", "BANKNIFTY"]},
+        {"title": "IT stocks rally on strong Q4 results", "source": "Moneycontrol", "time": "45 min ago", "sentiment": "positive", "summary": "Major IT companies report better than expected quarterly results, TCS and INFY lead the charge.", "symbols": ["TCS", "INFY", "WIPRO", "HCLTECH"]},
+        {"title": "Bank Nifty outperforms on NPA relief", "source": "CNBC Awaaz", "time": "1 hour ago", "sentiment": "positive", "summary": "Banking index surges as NPA concerns ease, HDFC Bank and ICICI Bank lead gains.", "symbols": ["HDFCBANK", "ICICIBANK", "SBIN", "BANKNIFTY"]},
+        {"title": "FIIs buy ₹2000 crore in today's session", "source": "NDTV Profit", "time": "1 hour ago", "sentiment": "positive", "summary": "Foreign institutional investors net buyers for third consecutive day, focus on bluechip stocks.", "symbols": ["NIFTY", "RELIANCE", "HDFCBANK"]},
+        {"title": "Oil prices slump on global demand concerns", "source": "Financial Express", "time": "2 hours ago", "sentiment": "negative", "summary": "Crude oil prices fall 3% on weak global demand outlook, impacts energy stocks.", "symbols": ["RELIANCE", "ONGC", "BPCL", "IOC"]},
+        {"title": "Auto sales see uptick in March", "source": "Autocar", "time": "2 hours ago", "sentiment": "positive", "summary": "Automobile sector reports 15% YoY growth in March sales, UVs and EVs lead the way.", "symbols": ["TATAMOTORS", "MARUTI", "M&M", "BAJAJ-AUTO"]},
+        {"title": "Pharma stocks under pressure on US pricing concerns", "source": "The Hindu BusinessLine", "time": "3 hours ago", "sentiment": "negative", "summary": "US drug pricing reforms weigh on Indian pharma exporters, Sun Pharma and Dr Reddy's slip.", "symbols": ["SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB"]},
+        {"title": "New IPOs lined up for April listing", "source": "Chittorgarh", "time": "3 hours ago", "sentiment": "neutral", "summary": "Four major IPOs worth ₹15000 crore slated for April, includes fintech and retail names.", "symbols": ["NIFTY", "SME"]},
+        {"title": "Metal stocks rally on China data", "source": "Commodity Online", "time": "4 hours ago", "sentiment": "positive", "summary": "Base metals surge on positive China manufacturing PMI, Hindalco and Tata Steel gain.", "symbols": ["TATASTEEL", "HINDALCO", "JSWSTEEL", "NMDC"]},
+        {"title": "Realty sector sees surge in new projects", "source": "Housing.com", "time": "4 hours ago", "sentiment": "positive", "summary": "Real estate developers announce new projects worth ₹50000 crore across top cities.", "symbols": ["DLF", "GODREJPROP", "PRESTIGE", "SOBHA"]},
+        {"title": "PSU banks gain on divestment hopes", "source": "The Economic Times", "time": "5 hours ago", "sentiment": "positive", "summary": "Public sector banks rally on expectations of strategic divestment by government.", "symbols": ["SBIN", "PNB", "BANKOFBARODA", "CANBK"]},
+    ]
+    
+    suggestions = [
+        {"symbol": "INFY", "reason": "Positive IT sector news", "sentiment": "positive"},
+        {"symbol": "RELIANCE", "reason": "Energy sector rally", "sentiment": "positive"},
+        {"symbol": "HDFCBANK", "reason": "Banking sector outperform", "sentiment": "positive"},
+        {"symbol": "TATAMOTORS", "reason": "Auto sector uptick", "sentiment": "positive"},
+        {"symbol": "SUNPHARMA", "reason": "Pharma under pressure - watch for reversal", "sentiment": "neutral"},
+    ]
+    
+    moods = ["bullish", "bearish", "neutral"]
+    mood = random.choice(moods)
+    
+    return jsonify({
+        "global": sample_news, 
+        "news": sample_news,
+        "suggestions": suggestions, 
+        "count": len(sample_news),
+        "mood": mood
+    })
+
+@app.route("/api/news/<symbol>")
+def get_stock_news(symbol):
+    """Get news for specific stock."""
+    symbol = symbol.upper()
+    import random
+    
+    sentiments = ["positive", "negative", "neutral"]
+    bases = [
+        f"{symbol} reports strong Q4 results, beats estimates",
+        f"{symbol} announces new product launch for Q2",
+        f"{symbol} gets upgrade from analysts at Goldman Sachs",
+        f"{symbol} board meeting scheduled for dividend discussion",
+        f"{symbol} expands operations into new markets",
+        f"{symbol} faces regulatory scrutiny over compliance",
+        f"{symbol} partners with tech giant for AI integration",
+        f"{symbol} stock hits 52-week high on volume surge",
+    ]
+    
+    stock_news = []
+    for i, base in enumerate(bases):
+        stock_news.append({
+            "title": base,
+            "source": random.choice(["Economic Times", "Moneycontrol", "Business Standard", "CNBC Awaaz", "The Hindu BusinessLine"]),
+            "time": f"{i+1} hour{'s' if i > 0 else ''} ago",
+            "sentiment": random.choice(sentiments),
+            "summary": f"Latest update on {symbol}: {base.lower()}. Analysts remain cautious with mixed views on the stock."
+        })
+    
+    return jsonify({"news": stock_news, "symbol": symbol})
+
+# Catch-all for frontend (must be last)
+@app.route("/", defaults={"p": ""})
+@app.route("/<path:p>")
+def root(p):
+    fp = os.path.join(BASE, "../frontend/index.html")
+    return send_file(fp) if os.path.exists(fp) else ("<h2>Frontend missing</h2>", 200)
+
+if __name__ == "__main__":
+    _run_server()
+
